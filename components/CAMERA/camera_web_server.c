@@ -32,8 +32,12 @@ static esp_err_t index_handler(httpd_req_t *req)
         "</head><body><div class='card'>"
         "<h2>ESP32-S3 OV5640 Camera Test</h2>"
         "<p>Use this page to verify whether OV5640 image capture works.</p>"
-        "<p><a href='/capture'>Capture one JPEG</a><a href='/stream'>Open MJPEG stream</a></p>"
-        "<img src='/stream'>"
+        "<p>"
+        "<a href='/capture'>Capture one JPEG</a>"
+        "<a href='/stream'>Open MJPEG stream</a>"
+        "</p>"
+        "<p>Power saving mode: this page does not auto-start camera stream.</p>"
+        "<img src='/capture'>"
         "</div></body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -106,7 +110,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     return res;
