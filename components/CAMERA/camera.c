@@ -51,7 +51,7 @@ static camera_config_t camera_config = {
 
     // 【修改】调试阶段建议先降到 20MHz，更稳定；
     // 如果你的 OV5640 模块自带外部时钟，CAM_PIN_XCLK 才可以为 GPIO_NUM_NC。
-    .xclk_freq_hz = 20000000,
+    .xclk_freq_hz = 10000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
@@ -59,7 +59,7 @@ static camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_JPEG,
 
     // 【修改】调试阶段先用 VGA/QVGA，确认采集成功后再提高到 UXGA。
-    .frame_size = FRAMESIZE_VGA,
+    .frame_size = FRAMESIZE_QVGA,
 
     .jpeg_quality = 12,
     .fb_count = 1,
@@ -114,7 +114,7 @@ esp_err_t camera_init(void)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_framesize(s, FRAMESIZE_VGA);
+        s->set_framesize(s, FRAMESIZE_QVGA);
         s->set_quality(s, 12);
         s->set_brightness(s, 0);
         s->set_contrast(s, 0);
