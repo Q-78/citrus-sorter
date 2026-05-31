@@ -1,13 +1,16 @@
 set(src_dirs
             CAMERA
+            FRUIT_DETECT
             LED)
 
 set(include_dirs
             CAMERA
+            FRUIT_DETECT
             LED)
 
 set(requires
             esp32-camera
+            esp_jpeg
             driver
             esp_http_server
             esp_wifi

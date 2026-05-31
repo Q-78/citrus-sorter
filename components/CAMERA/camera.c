@@ -1,11 +1,13 @@
 #include "camera.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_camera.h"
 #include "esp_log.h"
 
 static const char *TAG = "camera";
+static SemaphoreHandle_t s_camera_lock;
 
 // ================= OV5640 / OV2640 Camera Pin Map =================
 // Based on Freenove ESP32-S3 WROOM Pinout camera labels
@@ -85,6 +87,14 @@ static void camera_gpio_output_if_valid(gpio_num_t pin)
 
 esp_err_t camera_init(void)
 {
+    if (!s_camera_lock) {
+        s_camera_lock = xSemaphoreCreateMutex();
+        if (!s_camera_lock) {
+            ESP_LOGE(TAG, "Failed to create camera mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     if (CAM_PIN_XCLK == GPIO_NUM_NC) {
         ESP_LOGW(TAG, "CAM_PIN_XCLK is GPIO_NUM_NC. Make sure the OV5640 module has an external XCLK/clock source, otherwise capture will fail.");
     }
@@ -127,9 +137,18 @@ esp_err_t camera_init(void)
 
 camera_fb_t *camera_capture(void)
 {
+    if (s_camera_lock &&
+        xSemaphoreTake(s_camera_lock, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW(TAG, "Camera is busy");
+        return NULL;
+    }
+
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(TAG, "Camera capture failed");
+        if (s_camera_lock) {
+            xSemaphoreGive(s_camera_lock);
+        }
         return NULL;
     }
 
@@ -143,5 +162,8 @@ void camera_return(camera_fb_t *fb)
 {
     if (fb) {
         esp_camera_fb_return(fb);
+        if (s_camera_lock) {
+            xSemaphoreGive(s_camera_lock);
+        }
     }
 }

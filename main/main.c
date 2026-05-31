@@ -11,6 +11,7 @@
 
 #include "camera.h"
 #include "camera_web_server.h"
+#include "fruit_detect.h"
 
 static const char *TAG = "main";
 
@@ -72,6 +73,7 @@ void app_main(void)
         return;
     }
 
+    fruit_detect_init();
     start_camera_web_server();
 
     while (true) {
