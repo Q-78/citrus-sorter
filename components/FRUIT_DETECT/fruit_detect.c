@@ -11,7 +11,8 @@
 static const char *TAG = "fruit_detect";
 
 #define MAX_LABELS 512
-#define MIN_BLOB_AREA 90
+#define MIN_BLOB_AREA 350
+#define MIN_DIAMETER_PX 35
 #define SMALL_MAX_DIAMETER_PX 45
 #define MEDIUM_MAX_DIAMETER_PX 80
 
@@ -23,6 +24,7 @@ typedef struct {
     uint16_t max_x;
     uint16_t min_y;
     uint16_t max_y;
+    uint32_t perimeter;
 } component_stats_t;
 
 static void *detect_malloc(size_t size)
@@ -89,17 +91,88 @@ static bool is_citrus_pixel(uint8_t r, uint8_t g, uint8_t b)
     int minc = min3(r, g, b);
     int delta = maxc - minc;
 
-    if (maxc < 70 || delta < 24) {
+    if (maxc < 80 || delta < 35) {
         return false;
     }
 
     int saturation = delta * 255 / maxc;
     int hue = rgb_hue_deg(r, g, b);
 
-    return saturation >= 45 &&
-           hue >= 8 && hue <= 82 &&
-           r >= b + 22 &&
-           g >= b + 8;
+    return saturation >= 70 &&
+           hue >= 12 && hue <= 62 &&
+           r >= 90 &&
+           g >= 45 &&
+           r >= b + 35 &&
+           g >= b + 15 &&
+           b * 100 <= maxc * 48 &&
+           g * 100 >= r * 30 &&
+           g * 100 <= r * 105;
+}
+
+static void open_mask_3x3(uint8_t *mask, uint8_t *scratch, uint16_t width, uint16_t height)
+{
+    memset(scratch, 0, (size_t)width * height);
+
+    for (uint16_t y = 1; y + 1 < height; y++) {
+        for (uint16_t x = 1; x + 1 < width; x++) {
+            uint8_t count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    count += mask[(size_t)(y + dy) * width + (x + dx)] ? 1 : 0;
+                }
+            }
+            scratch[(size_t)y * width + x] = count >= 7 ? 1 : 0;
+        }
+    }
+
+    memset(mask, 0, (size_t)width * height);
+
+    for (uint16_t y = 1; y + 1 < height; y++) {
+        for (uint16_t x = 1; x + 1 < width; x++) {
+            size_t idx = (size_t)y * width + x;
+            if (!scratch[idx]) {
+                continue;
+            }
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    mask[(size_t)(y + dy) * width + (x + dx)] = 1;
+                }
+            }
+        }
+    }
+}
+
+static uint16_t isqrt_u32(uint32_t value)
+{
+    uint32_t bit = 1UL << 30;
+    uint32_t result = 0;
+
+    while (bit > value) {
+        bit >>= 2;
+    }
+
+    while (bit != 0) {
+        if (value >= result + bit) {
+            value -= result + bit;
+            result = (result >> 1) + bit;
+        } else {
+            result >>= 1;
+        }
+        bit >>= 2;
+    }
+
+    return (uint16_t)result;
+}
+
+static uint16_t clamp_u16(uint16_t value, uint16_t low, uint16_t high)
+{
+    if (value < low) {
+        return low;
+    }
+    if (value > high) {
+        return high;
+    }
+    return value;
 }
 
 static void uf_init(uint16_t *parent, uint16_t count)
@@ -219,6 +292,15 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
 
     free(rgb);
 
+    uint8_t *scratch = detect_malloc(total_pixels);
+    if (!scratch) {
+        ESP_LOGE(TAG, "No memory for mask scratch, need %u bytes", (unsigned int)total_pixels);
+        free(mask);
+        return ESP_ERR_NO_MEM;
+    }
+    open_mask_3x3(mask, scratch, img_w, img_h);
+    free(scratch);
+
     uint16_t *labels = detect_calloc(total_pixels, sizeof(uint16_t));
     uint16_t *parent = detect_malloc(MAX_LABELS * sizeof(uint16_t));
     if (!labels || !parent) {
@@ -281,6 +363,7 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
             }
 
             uint16_t root = uf_find(parent, raw_label);
+            labels[idx] = root;
             component_stats_t *s = &stats[root];
             s->sum_x += x;
             s->sum_y += y;
@@ -301,7 +384,24 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         }
     }
 
-    free(labels);
+    for (uint16_t y = 0; y < img_h; y++) {
+        for (uint16_t x = 0; x < img_w; x++) {
+            size_t idx = (size_t)y * img_w + x;
+            uint16_t root = labels[idx];
+            if (root == 0) {
+                continue;
+            }
+
+            bool edge = x == 0 || y == 0 || x + 1 == img_w || y + 1 == img_h ||
+                        labels[idx - 1] != root ||
+                        labels[idx + 1] != root ||
+                        labels[(size_t)(y - 1) * img_w + x] != root ||
+                        labels[(size_t)(y + 1) * img_w + x] != root;
+            if (edge) {
+                stats[root].perimeter++;
+            }
+        }
+    }
 
     for (uint16_t i = 1; i < next_label && result->count < FRUIT_DETECT_MAX_FRUITS; i++) {
         if (uf_find(parent, i) != i) {
@@ -309,7 +409,11 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         }
 
         component_stats_t *s = &stats[i];
-        if (s->count < MIN_BLOB_AREA) {
+        uint32_t dynamic_min_area = total_pixels / 220;
+        if (dynamic_min_area < MIN_BLOB_AREA) {
+            dynamic_min_area = MIN_BLOB_AREA;
+        }
+        if (s->count < dynamic_min_area || s->perimeter == 0) {
             continue;
         }
 
@@ -318,12 +422,23 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         uint16_t min_side = bbox_w < bbox_h ? bbox_w : bbox_h;
         uint16_t max_side = bbox_w > bbox_h ? bbox_w : bbox_h;
         uint32_t bbox_area = (uint32_t)bbox_w * bbox_h;
+        uint32_t circularity100 =
+            (uint32_t)((1256ULL * s->count) / ((uint64_t)s->perimeter * s->perimeter));
 
-        if (min_side < 6 || max_side > min_side * 3 || s->count * 100 < bbox_area * 15) {
+        if (min_side < 12 ||
+            max_side > min_side * 2 ||
+            s->count * 100 < bbox_area * 22 ||
+            circularity100 < 32) {
             continue;
         }
 
-        uint16_t diameter = max_side;
+        uint16_t area_diameter = isqrt_u32((uint32_t)((s->count * 400UL + 157UL) / 314UL));
+        if (area_diameter < MIN_DIAMETER_PX || max_side < MIN_DIAMETER_PX) {
+            continue;
+        }
+        uint16_t diameter = (area_diameter * 108U) / 100U;
+        diameter = clamp_u16(diameter, MIN_DIAMETER_PX, max_side);
+
         fruit_grade_t grade = FRUIT_GRADE_SMALL;
         if (diameter > MEDIUM_MAX_DIAMETER_PX) {
             grade = FRUIT_GRADE_LARGE;
@@ -335,14 +450,22 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         f->center_x = (uint16_t)(s->sum_x / s->count);
         f->center_y = (uint16_t)(s->sum_y / s->count);
         f->diameter_px = diameter;
-        f->bbox_x = s->min_x;
-        f->bbox_y = s->min_y;
-        f->bbox_w = bbox_w;
-        f->bbox_h = bbox_h;
+        uint16_t half = diameter / 2;
+        f->bbox_x = f->center_x > half ? f->center_x - half : 0;
+        f->bbox_y = f->center_y > half ? f->center_y - half : 0;
+        if (f->bbox_x + diameter > img_w) {
+            f->bbox_x = img_w > diameter ? img_w - diameter : 0;
+        }
+        if (f->bbox_y + diameter > img_h) {
+            f->bbox_y = img_h > diameter ? img_h - diameter : 0;
+        }
+        f->bbox_w = diameter;
+        f->bbox_h = diameter;
         f->area_px = s->count;
         f->size_grade = grade;
     }
 
+    free(labels);
     free(stats);
     free(parent);
 
