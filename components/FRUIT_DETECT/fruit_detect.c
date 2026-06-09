@@ -175,6 +175,203 @@ static uint16_t clamp_u16(uint16_t value, uint16_t low, uint16_t high)
     return value;
 }
 
+static void stats_init(component_stats_t *s, uint16_t img_w, uint16_t img_h)
+{
+    memset(s, 0, sizeof(*s));
+    s->min_x = img_w;
+    s->min_y = img_h;
+}
+
+static void stats_add_pixel(component_stats_t *s, uint16_t x, uint16_t y)
+{
+    s->sum_x += x;
+    s->sum_y += y;
+    s->count++;
+
+    if (x < s->min_x) {
+        s->min_x = x;
+    }
+    if (x > s->max_x) {
+        s->max_x = x;
+    }
+    if (y < s->min_y) {
+        s->min_y = y;
+    }
+    if (y > s->max_y) {
+        s->max_y = y;
+    }
+}
+
+static bool append_fruit_result(fruit_detect_result_t *result,
+                                uint16_t img_w,
+                                uint16_t img_h,
+                                component_stats_t *s,
+                                uint32_t min_area,
+                                bool strict_shape)
+{
+    if (result->count >= FRUIT_DETECT_MAX_FRUITS ||
+        s->count < min_area ||
+        s->min_x > s->max_x ||
+        s->min_y > s->max_y) {
+        return false;
+    }
+
+    uint16_t bbox_w = s->max_x - s->min_x + 1;
+    uint16_t bbox_h = s->max_y - s->min_y + 1;
+    uint16_t min_side = bbox_w < bbox_h ? bbox_w : bbox_h;
+    uint16_t max_side = bbox_w > bbox_h ? bbox_w : bbox_h;
+    uint32_t bbox_area = (uint32_t)bbox_w * bbox_h;
+    uint32_t min_density = strict_shape ? 22 : 16;
+    uint32_t max_aspect_x10 = strict_shape ? 20 : 26;
+
+    if (min_side < 12 ||
+        max_side * 10 > min_side * max_aspect_x10 ||
+        s->count * 100 < bbox_area * min_density) {
+        return false;
+    }
+
+    uint16_t area_diameter = isqrt_u32((uint32_t)((s->count * 400UL + 157UL) / 314UL));
+    if (area_diameter < MIN_DIAMETER_PX || max_side < MIN_DIAMETER_PX) {
+        return false;
+    }
+
+    uint16_t diameter = (area_diameter * 108U) / 100U;
+    diameter = clamp_u16(diameter, MIN_DIAMETER_PX, max_side);
+
+    fruit_grade_t grade = FRUIT_GRADE_SMALL;
+    if (diameter > MEDIUM_MAX_DIAMETER_PX) {
+        grade = FRUIT_GRADE_LARGE;
+    } else if (diameter > SMALL_MAX_DIAMETER_PX) {
+        grade = FRUIT_GRADE_MEDIUM;
+    }
+
+    fruit_info_t *f = &result->fruits[result->count++];
+    f->center_x = (uint16_t)(s->sum_x / s->count);
+    f->center_y = (uint16_t)(s->sum_y / s->count);
+    f->diameter_px = diameter;
+
+    uint16_t half = diameter / 2;
+    f->bbox_x = f->center_x > half ? f->center_x - half : 0;
+    f->bbox_y = f->center_y > half ? f->center_y - half : 0;
+    if (f->bbox_x + diameter > img_w) {
+        f->bbox_x = img_w > diameter ? img_w - diameter : 0;
+    }
+    if (f->bbox_y + diameter > img_h) {
+        f->bbox_y = img_h > diameter ? img_h - diameter : 0;
+    }
+    f->bbox_w = diameter;
+    f->bbox_h = diameter;
+    f->area_px = s->count;
+    f->size_grade = grade;
+
+    return true;
+}
+
+static uint8_t try_axis_split(fruit_detect_result_t *result,
+                              uint16_t *labels,
+                              component_stats_t *stats,
+                              uint16_t root,
+                              uint16_t img_w,
+                              uint16_t img_h,
+                              uint32_t min_area)
+{
+    component_stats_t *s = &stats[root];
+    uint16_t bbox_w = s->max_x - s->min_x + 1;
+    uint16_t bbox_h = s->max_y - s->min_y + 1;
+    bool split_x;
+
+    if (bbox_w * 10 >= bbox_h * 15) {
+        split_x = true;
+    } else if (bbox_h * 10 >= bbox_w * 15) {
+        split_x = false;
+    } else {
+        return 0;
+    }
+
+    uint16_t axis_len = split_x ? bbox_w : bbox_h;
+    uint16_t *projection = detect_calloc(axis_len, sizeof(uint16_t));
+    if (!projection) {
+        return 0;
+    }
+
+    for (uint16_t y = s->min_y; y <= s->max_y; y++) {
+        for (uint16_t x = s->min_x; x <= s->max_x; x++) {
+            if (labels[(size_t)y * img_w + x] != root) {
+                continue;
+            }
+            uint16_t axis = split_x ? (x - s->min_x) : (y - s->min_y);
+            projection[axis]++;
+        }
+    }
+
+    uint16_t search_start = axis_len / 4;
+    uint16_t search_end = axis_len - search_start;
+    uint16_t valley = search_start;
+    uint16_t valley_count = UINT16_MAX;
+
+    for (uint16_t i = search_start; i < search_end; i++) {
+        if (projection[i] < valley_count) {
+            valley_count = projection[i];
+            valley = i;
+        }
+    }
+
+    uint16_t left_max = 0;
+    uint16_t right_max = 0;
+    for (uint16_t i = 0; i < valley; i++) {
+        if (projection[i] > left_max) {
+            left_max = projection[i];
+        }
+    }
+    for (uint16_t i = valley + 1; i < axis_len; i++) {
+        if (projection[i] > right_max) {
+            right_max = projection[i];
+        }
+    }
+
+    free(projection);
+
+    uint16_t side_max = left_max < right_max ? left_max : right_max;
+    if (side_max == 0 || valley_count * 100 > side_max * 58) {
+        return 0;
+    }
+
+    component_stats_t a;
+    component_stats_t b;
+    stats_init(&a, img_w, img_h);
+    stats_init(&b, img_w, img_h);
+
+    uint16_t split_coord = split_x ? (s->min_x + valley) : (s->min_y + valley);
+
+    for (uint16_t y = s->min_y; y <= s->max_y; y++) {
+        for (uint16_t x = s->min_x; x <= s->max_x; x++) {
+            if (labels[(size_t)y * img_w + x] != root) {
+                continue;
+            }
+            if ((split_x && x <= split_coord) || (!split_x && y <= split_coord)) {
+                stats_add_pixel(&a, x, y);
+            } else {
+                stats_add_pixel(&b, x, y);
+            }
+        }
+    }
+
+    uint8_t before = result->count;
+    uint32_t split_min_area = min_area / 2;
+    if (split_min_area < 260) {
+        split_min_area = 260;
+    }
+
+    bool ok_a = append_fruit_result(result, img_w, img_h, &a, split_min_area, false);
+    bool ok_b = append_fruit_result(result, img_w, img_h, &b, split_min_area, false);
+    if (ok_a && ok_b) {
+        return 2;
+    }
+
+    result->count = before;
+    return 0;
+}
+
 static void uf_init(uint16_t *parent, uint16_t count)
 {
     for (uint16_t i = 0; i < count; i++) {
@@ -425,6 +622,10 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         uint32_t circularity100 =
             (uint32_t)((1256ULL * s->count) / ((uint64_t)s->perimeter * s->perimeter));
 
+        if (try_axis_split(result, labels, stats, i, img_w, img_h, dynamic_min_area) == 2) {
+            continue;
+        }
+
         if (min_side < 12 ||
             max_side > min_side * 2 ||
             s->count * 100 < bbox_area * 22 ||
@@ -432,37 +633,7 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
             continue;
         }
 
-        uint16_t area_diameter = isqrt_u32((uint32_t)((s->count * 400UL + 157UL) / 314UL));
-        if (area_diameter < MIN_DIAMETER_PX || max_side < MIN_DIAMETER_PX) {
-            continue;
-        }
-        uint16_t diameter = (area_diameter * 108U) / 100U;
-        diameter = clamp_u16(diameter, MIN_DIAMETER_PX, max_side);
-
-        fruit_grade_t grade = FRUIT_GRADE_SMALL;
-        if (diameter > MEDIUM_MAX_DIAMETER_PX) {
-            grade = FRUIT_GRADE_LARGE;
-        } else if (diameter > SMALL_MAX_DIAMETER_PX) {
-            grade = FRUIT_GRADE_MEDIUM;
-        }
-
-        fruit_info_t *f = &result->fruits[result->count++];
-        f->center_x = (uint16_t)(s->sum_x / s->count);
-        f->center_y = (uint16_t)(s->sum_y / s->count);
-        f->diameter_px = diameter;
-        uint16_t half = diameter / 2;
-        f->bbox_x = f->center_x > half ? f->center_x - half : 0;
-        f->bbox_y = f->center_y > half ? f->center_y - half : 0;
-        if (f->bbox_x + diameter > img_w) {
-            f->bbox_x = img_w > diameter ? img_w - diameter : 0;
-        }
-        if (f->bbox_y + diameter > img_h) {
-            f->bbox_y = img_h > diameter ? img_h - diameter : 0;
-        }
-        f->bbox_w = diameter;
-        f->bbox_h = diameter;
-        f->area_px = s->count;
-        f->size_grade = grade;
+        append_fruit_result(result, img_w, img_h, s, dynamic_min_area, true);
     }
 
     free(labels);

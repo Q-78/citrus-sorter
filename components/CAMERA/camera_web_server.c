@@ -12,6 +12,7 @@
 #include "camera.h"
 #include "camera_web_server.h"
 #include "fruit_detect.h"
+#include "m0_uart.h"
 
 static const char *TAG = "camera_web";
 
@@ -138,6 +139,11 @@ static esp_err_t index_handler(httpd_req_t *req)
         result.image_width = fb->width;
         result.image_height = fb->height;
         ESP_LOGW(TAG, "Fruit detection failed: 0x%x", det_ret);
+    } else {
+        esp_err_t uart_ret = m0_uart_send_result(&result);
+        if (uart_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
+        }
     }
 
     esp_err_t res = ESP_OK;
