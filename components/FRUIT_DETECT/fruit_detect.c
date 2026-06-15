@@ -13,8 +13,7 @@ static const char *TAG = "fruit_detect";
 #define MAX_LABELS 512
 #define MIN_BLOB_AREA 350
 #define MIN_DIAMETER_PX 35
-#define SMALL_MAX_DIAMETER_PX 45
-#define MEDIUM_MAX_DIAMETER_PX 80
+#define LARGE_MIN_BOX_SPAN_PX 40
 
 typedef struct {
     uint32_t sum_x;
@@ -238,13 +237,6 @@ static bool append_fruit_result(fruit_detect_result_t *result,
     uint16_t diameter = (area_diameter * 108U) / 100U;
     diameter = clamp_u16(diameter, MIN_DIAMETER_PX, max_side);
 
-    fruit_grade_t grade = FRUIT_GRADE_SMALL;
-    if (diameter > MEDIUM_MAX_DIAMETER_PX) {
-        grade = FRUIT_GRADE_LARGE;
-    } else if (diameter > SMALL_MAX_DIAMETER_PX) {
-        grade = FRUIT_GRADE_MEDIUM;
-    }
-
     fruit_info_t *f = &result->fruits[result->count++];
     f->center_x = (uint16_t)(s->sum_x / s->count);
     f->center_y = (uint16_t)(s->sum_y / s->count);
@@ -262,7 +254,7 @@ static bool append_fruit_result(fruit_detect_result_t *result,
     f->bbox_w = diameter;
     f->bbox_h = diameter;
     f->area_px = s->count;
-    f->size_grade = grade;
+    f->size_grade = (diameter - 1 > LARGE_MIN_BOX_SPAN_PX) ? FRUIT_GRADE_LARGE : FRUIT_GRADE_SMALL;
 
     return true;
 }
@@ -409,8 +401,6 @@ const char *fruit_grade_label(fruit_grade_t grade)
     switch (grade) {
     case FRUIT_GRADE_LARGE:
         return "Large";
-    case FRUIT_GRADE_MEDIUM:
-        return "Medium";
     case FRUIT_GRADE_SMALL:
     default:
         return "Small";

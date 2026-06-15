@@ -14,8 +14,7 @@ extern "C" {
 
 typedef enum {
     FRUIT_GRADE_SMALL = 0,
-    FRUIT_GRADE_MEDIUM,
-    FRUIT_GRADE_LARGE,
+    FRUIT_GRADE_LARGE = 1,
 } fruit_grade_t;
 
 typedef struct {

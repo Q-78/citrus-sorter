@@ -79,12 +79,19 @@ static esp_err_t send_base64_data(httpd_req_t *req, const uint8_t *data, size_t 
     return ESP_OK;
 }
 
-static esp_err_t send_detection_json(httpd_req_t *req, const fruit_detect_result_t *result)
+static esp_err_t send_detection_json(httpd_req_t *req,
+                                     const fruit_detect_result_t *result,
+                                     const m0_uart_payload_t *payload)
 {
     char buf[512];
     int len = snprintf(buf, sizeof(buf),
-                       "{\"image_width\":%u,\"image_height\":%u,\"count\":%u,\"fruits\":[",
-                       result->image_width, result->image_height, result->count);
+                       "{\"image_width\":%u,\"image_height\":%u,\"count\":%u,"
+                       "\"uart\":{\"header\":\"0xAA\",\"has_fruit\":%u,\"grade\":%u,"
+                       "\"x\":%u,\"y\":%u},"
+                       "\"fruits\":[",
+                       result->image_width, result->image_height, result->count,
+                       payload->has_fruit, payload->grade,
+                       payload->x, payload->y);
     esp_err_t err = httpd_resp_send_chunk(req, buf, len);
     if (err != ESP_OK) {
         return err;
@@ -134,12 +141,14 @@ static esp_err_t index_handler(httpd_req_t *req)
 
     fruit_detect_result_t result;
     esp_err_t det_ret = fruit_detect_process(fb, &result);
+    m0_uart_payload_t uart_payload = {0};
     if (det_ret != ESP_OK) {
         memset(&result, 0, sizeof(result));
         result.image_width = fb->width;
         result.image_height = fb->height;
         ESP_LOGW(TAG, "Fruit detection failed: 0x%x", det_ret);
     } else {
+        m0_uart_build_payload(&result, &uart_payload);
         esp_err_t uart_ret = m0_uart_send_result(&result);
         if (uart_ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
@@ -163,15 +172,18 @@ static esp_err_t index_handler(httpd_req_t *req)
         ".card{background:#17202a;border:1px solid #263645;border-radius:8px;padding:12px}.label{font-size:12px;color:#9aa7b5}.value{font-size:24px;font-weight:800;margin-top:4px}"
         "table{width:100%;border-collapse:collapse;background:#17202a;border:1px solid #263645;border-radius:8px;overflow:hidden}"
         "th,td{padding:8px;border-bottom:1px solid #263645;text-align:left;font-size:13px}th{background:#223042;color:#b9c6d3}.empty{padding:14px;color:#9aa7b5}"
-        ".ok{color:#55d68b}.warn{color:#ffbd5a}.small{color:#7bdff2}.medium{color:#ffbd5a}.large{color:#ff6b6b}"
+        ".ok{color:#55d68b}.warn{color:#ffbd5a}.small{color:#7bdff2}.large{color:#ff6b6b}"
         "</style></head><body><div class='bar'><h2>Citrus Sorter Debug</h2>"
         "<div class='actions'><a class='btn' href='/'>Refresh Capture</a>"
+        "<a class='btn secondary' href='/?auto=1'>Auto Refresh</a>"
         "<a class='btn secondary' href='/capture'>Raw JPEG</a>"
         "<a class='btn secondary' href='/stream'>MJPEG Stream</a></div></div>"
         "<div class='wrap'><div class='stage'><canvas id='view'></canvas></div>"
         "<div class='cards'><div class='card'><div class='label'>Fruits Found</div><div class='value' id='count'>0</div></div>"
         "<div class='card'><div class='label'>Image Size</div><div class='value' id='size'>--</div></div>"
-        "<div class='card'><div class='label'>Detection</div><div class='value' id='status'>--</div></div></div>"
+        "<div class='card'><div class='label'>Detection</div><div class='value' id='status'>--</div></div>"
+        "<div class='card'><div class='label'>M0 Frame</div><div class='value' id='m0frame'>--</div></div></div>"
+        "<div class='card'><div class='label'>M0 Coordinates</div><div id='m0coords' style='font-size:14px;margin-top:6px;line-height:1.7'></div></div>"
         "<div id='table'></div><script>const detectOk=";
 
     res = send_text_chunk(req, page_start);
@@ -182,7 +194,7 @@ static esp_err_t index_handler(httpd_req_t *req)
         res = send_text_chunk(req, ";const data=");
     }
     if (res == ESP_OK) {
-        res = send_detection_json(req, &result);
+        res = send_detection_json(req, &result, &uart_payload);
     }
     if (res == ESP_OK) {
         res = send_text_chunk(req, ";const imageSrc='data:image/jpeg;base64,");
@@ -191,13 +203,23 @@ static esp_err_t index_handler(httpd_req_t *req)
         res = send_base64_data(req, fb->buf, fb->len);
     }
 
+    bool auto_refresh = false;
+    size_t query_len = httpd_req_get_url_query_len(req) + 1;
+    char query[32];
+    if (query_len > 1 && query_len <= sizeof(query) &&
+        httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char auto_value[8];
+        auto_refresh = httpd_query_key_value(query, "auto", auto_value, sizeof(auto_value)) == ESP_OK &&
+                       strcmp(auto_value, "1") == 0;
+    }
+
     const char *page_end =
         "';const cv=document.getElementById('view');const ctx=cv.getContext('2d');"
         "const img=new Image();img.onload=function(){cv.width=img.naturalWidth;cv.height=img.naturalHeight;"
         "ctx.drawImage(img,0,0);drawOverlay();fillInfo();};img.src=imageSrc;"
-        "function gradeClass(g){return g===2?'large':g===1?'medium':'small'}"
+        "function gradeClass(g){return g===1?'large':'small'}"
         "function drawOverlay(){for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];"
-        "const cls=gradeClass(f.size_grade);const color=cls==='large'?'#ff6b6b':cls==='medium'?'#ffbd5a':'#7bdff2';"
+        "const cls=gradeClass(f.size_grade);const color=cls==='large'?'#ff6b6b':'#7bdff2';"
         "ctx.strokeStyle=color;ctx.lineWidth=2;ctx.strokeRect(f.bbox_x,f.bbox_y,f.bbox_w,f.bbox_h);"
         "ctx.beginPath();ctx.arc(f.center_x,f.center_y,Math.max(4,f.diameter_px/2),0,Math.PI*2);ctx.stroke();"
         "ctx.beginPath();ctx.moveTo(f.center_x-5,f.center_y);ctx.lineTo(f.center_x+5,f.center_y);"
@@ -208,15 +230,29 @@ static esp_err_t index_handler(httpd_req_t *req)
         "function fillInfo(){document.getElementById('count').textContent=data.count;"
         "document.getElementById('size').textContent=data.image_width+' x '+data.image_height;"
         "const s=document.getElementById('status');s.textContent=detectOk?'OK':'Decode Error';s.className='value '+(detectOk?'ok':'warn');"
+        "const u=data.uart;document.getElementById('m0frame').textContent=u.header+' '+u.has_fruit+' '+u.grade+' '+u.x+' '+u.y;"
+        "document.getElementById('m0coords').innerHTML='has_fruit: '+u.has_fruit+' &nbsp; grade: '+u.grade+'<br>'"
+        "+'x: '+u.x+' &nbsp; y: '+u.y;"
         "let html='';if(data.fruits.length===0){html='<div class=\"empty\">No citrus-colored fruit region found.</div>';}else{"
         "html='<table><thead><tr><th>#</th><th>Center</th><th>Diameter</th><th>Area</th><th>Box</th><th>Grade</th></tr></thead><tbody>';"
         "for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];const cls=gradeClass(f.size_grade);"
         "html+='<tr><td>'+(i+1)+'</td><td>'+f.center_x+', '+f.center_y+'</td><td>'+f.diameter_px+' px</td><td>'+f.area_px+' px</td><td>'+f.bbox_w+' x '+f.bbox_h+'</td><td class=\"'+cls+'\">'+f.grade_label+'</td></tr>';}"
         "html+='</tbody></table>';}document.getElementById('table').innerHTML=html;}"
-        "</script></div></body></html>";
+        "const autoRefresh=";
 
     if (res == ESP_OK) {
         res = send_text_chunk(req, page_end);
+    }
+    if (res == ESP_OK) {
+        res = send_text_chunk(req, auto_refresh ? "true" : "false");
+    }
+
+    const char *page_finish =
+        ";if(autoRefresh){setTimeout(function(){location.href='/?auto=1';},1000);}"
+        "</script></div></body></html>";
+
+    if (res == ESP_OK) {
+        res = send_text_chunk(req, page_finish);
     }
 
     camera_return(fb);

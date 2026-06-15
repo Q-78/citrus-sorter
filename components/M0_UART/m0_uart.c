@@ -13,7 +13,7 @@ static const char *TAG = "m0_uart";
 #define M0_UART_TX_PIN GPIO_NUM_41
 #define M0_UART_BUF_SIZE 512
 #define M0_UART_FRAME_HEADER 0xAA
-#define M0_UART_FRAME_SIZE 4
+#define M0_UART_FRAME_SIZE 5
 /* Loopback debug, disabled for normal ESP32 -> M0 communication. */
 // #define M0_UART_LOOPBACK_DEBUG 1
 // #define M0_UART_RX_PIN GPIO_NUM_42
@@ -84,8 +84,7 @@ static void m0_uart_try_read_loopback(void)
     int len = uart_read_bytes(M0_UART_PORT, rx, sizeof(rx), pdMS_TO_TICKS(20));
 
     if (len > 0) {
-        ESP_LOGI(TAG, "Loopback RX (%d): %02X %02X %02X %02X",
-                 len, rx[0], rx[1], rx[2], rx[3]);
+        ESP_LOG_BUFFER_HEX(TAG, rx, len);
     }
 }
 #endif
@@ -95,32 +94,52 @@ static uint8_t clamp_coord_to_u8(uint16_t value)
     return value > 255 ? 255 : (uint8_t)value;
 }
 
-esp_err_t m0_uart_send_result(const fruit_detect_result_t *result)
+esp_err_t m0_uart_build_payload(const fruit_detect_result_t *result, m0_uart_payload_t *payload)
 {
-    if (!result) {
+    if (!result || !payload) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    uint16_t center_x = 0;
-    uint16_t center_y = 0;
-    uint8_t has_fruit = result->count > 0 ? 1 : 0;
+    payload->has_fruit = result->count > 0 ? 1 : 0;
+    payload->grade = 0;
+    payload->x = 0;
+    payload->y = 0;
 
-    if (has_fruit) {
-        center_x = result->fruits[0].center_x;
-        center_y = result->fruits[0].center_y;
+    if (payload->has_fruit) {
+        const fruit_info_t *fruit = &result->fruits[0];
+        uint16_t x_min = fruit->bbox_x;
+        uint16_t x_max = fruit->bbox_x + fruit->bbox_w - 1;
+        uint16_t y_min = fruit->bbox_y;
+        uint16_t y_max = fruit->bbox_y + fruit->bbox_h - 1;
+
+        payload->grade = (x_max - x_min > 40 || y_max - y_min > 40) ? 1 : 0;
+        payload->x = clamp_coord_to_u8((uint16_t)((x_min + x_max) / 2));
+        payload->y = clamp_coord_to_u8((uint16_t)((y_min + y_max) / 2));
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t m0_uart_send_result(const fruit_detect_result_t *result)
+{
+    m0_uart_payload_t payload;
+    esp_err_t ret = m0_uart_build_payload(result, &payload);
+    if (ret != ESP_OK) {
+        return ret;
     }
 
     uint8_t frame[M0_UART_FRAME_SIZE] = {
         M0_UART_FRAME_HEADER,
-        has_fruit,
-        clamp_coord_to_u8(center_x),
-        clamp_coord_to_u8(center_y),
+        payload.has_fruit,
+        payload.grade,
+        payload.x,
+        payload.y,
     };
 
-    esp_err_t ret = m0_uart_write_frame(frame, sizeof(frame));
+    ret = m0_uart_write_frame(frame, sizeof(frame));
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "Sent to M0: AA %02X %02X %02X",
-                 frame[1], frame[2], frame[3]);
+        ESP_LOGI(TAG, "Sent to M0: AA has=%u grade=%u x=%u y=%u",
+                 payload.has_fruit, payload.grade, payload.x, payload.y);
 #ifdef M0_UART_LOOPBACK_DEBUG
         uart_wait_tx_done(M0_UART_PORT, pdMS_TO_TICKS(20));
         m0_uart_try_read_loopback();
