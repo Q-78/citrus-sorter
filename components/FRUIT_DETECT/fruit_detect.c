@@ -421,6 +421,66 @@ typedef struct {
     uint16_t length;
 } horizontal_tick_t;
 
+static uint16_t clamp_i32_to_u16(int32_t value, uint16_t low, uint16_t high)
+{
+    if (value < (int32_t)low) {
+        return low;
+    }
+    if (value > (int32_t)high) {
+        return high;
+    }
+    return (uint16_t)value;
+}
+
+static uint16_t average_reference_tick_length(const horizontal_tick_t *a,
+                                              const horizontal_tick_t *b,
+                                              const horizontal_tick_t *c,
+                                              const horizontal_tick_t *d,
+                                              uint16_t img_w)
+{
+    const horizontal_tick_t *ticks[4] = {a, b, c, d};
+    uint32_t sum = 0;
+    uint16_t count = 0;
+    for (uint8_t i = 0; i < 4; i++) {
+        if (ticks[i] && ticks[i]->found && ticks[i]->length > 0) {
+            sum += ticks[i]->length;
+            count++;
+        }
+    }
+
+    uint16_t length = count > 0 ? (uint16_t)(sum / count) : (uint16_t)(img_w / 7);
+    if (length < 28) {
+        length = 28;
+    }
+    if (length > 96) {
+        length = 96;
+    }
+    return length;
+}
+
+static void predict_reference_tick(horizontal_tick_t *tick,
+                                   float x,
+                                   float y,
+                                   uint16_t img_w,
+                                   uint16_t img_h,
+                                   bool corner_on_left,
+                                   uint16_t length)
+{
+    if (!tick || img_w == 0 || img_h == 0) {
+        return;
+    }
+
+    uint16_t corner_x = clamp_i32_to_u16((int32_t)lroundf(x), 0, img_w - 1);
+    uint16_t corner_y = clamp_i32_to_u16((int32_t)lroundf(y), 0, img_h - 1);
+    int32_t far_x = corner_on_left ? (int32_t)corner_x + length : (int32_t)corner_x - length;
+
+    tick->found = true;
+    tick->corner_x = corner_x;
+    tick->far_x = clamp_i32_to_u16(far_x, 0, img_w - 1);
+    tick->y = corner_y;
+    tick->length = length;
+}
+
 static uint16_t reference_corner_vertical_support(const uint8_t *mask,
                                                   uint16_t img_w,
                                                   uint16_t img_h,
@@ -1158,23 +1218,52 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
     horizontal_tick_t rt;
     horizontal_tick_t rb;
     uint16_t left_x0 = img_w / 100;
-    uint16_t left_x1 = (uint16_t)((uint32_t)img_w * 45U / 100U);
-    uint16_t right_x0 = (uint16_t)((uint32_t)img_w * 55U / 100U);
+    uint16_t left_x1 = (uint16_t)((uint32_t)img_w * 50U / 100U);
+    uint16_t right_x0 = (uint16_t)((uint32_t)img_w * 50U / 100U);
     uint16_t right_x1 = img_w - img_w / 100 - 1;
-    uint16_t top_y0 = img_h / 8;
+    uint16_t top_y0 = img_h / 10;
     uint16_t top_y1 = img_h / 2;
     uint16_t bottom_y0 = img_h / 2;
-    uint16_t bottom_y1 = img_h - img_h / 12;
+    uint16_t bottom_y1 = img_h - img_h / 24;
 
-    if (!find_horizontal_tick(mask, img_w, img_h, left_x0, left_x1,
-                              top_y0, top_y1, true, &lt) ||
-        !find_horizontal_tick(mask, img_w, img_h, left_x0, left_x1,
-                              bottom_y0, bottom_y1, true, &lb) ||
-        !find_horizontal_tick(mask, img_w, img_h, right_x0, right_x1,
-                              top_y0, top_y1, false, &rt) ||
-        !find_horizontal_tick(mask, img_w, img_h, right_x0, right_x1,
-                              bottom_y0, bottom_y1, false, &rb)) {
+    bool lt_ok = find_horizontal_tick(mask, img_w, img_h, left_x0, left_x1,
+                                      top_y0, top_y1, true, &lt);
+    bool lb_ok = find_horizontal_tick(mask, img_w, img_h, left_x0, left_x1,
+                                      bottom_y0, bottom_y1, true, &lb);
+    bool rt_ok = find_horizontal_tick(mask, img_w, img_h, right_x0, right_x1,
+                                      top_y0, top_y1, false, &rt);
+    bool rb_ok = find_horizontal_tick(mask, img_w, img_h, right_x0, right_x1,
+                                      bottom_y0, bottom_y1, false, &rb);
+    uint8_t found_ticks = (lt_ok ? 1 : 0) + (lb_ok ? 1 : 0) +
+                          (rt_ok ? 1 : 0) + (rb_ok ? 1 : 0);
+
+    if (found_ticks < 3) {
         return false;
+    }
+
+    if (found_ticks == 3) {
+        uint16_t predicted_len = average_reference_tick_length(&lt, &lb, &rt, &rb, img_w);
+        if (!lt_ok && rt_ok && lb_ok && rb_ok) {
+            predict_reference_tick(&lt,
+                                   (float)rt.corner_x + (float)lb.corner_x - (float)rb.corner_x,
+                                   (float)rt.y + (float)lb.y - (float)rb.y,
+                                   img_w, img_h, true, predicted_len);
+        } else if (!rt_ok && lt_ok && lb_ok && rb_ok) {
+            predict_reference_tick(&rt,
+                                   (float)lt.corner_x + (float)rb.corner_x - (float)lb.corner_x,
+                                   (float)lt.y + (float)rb.y - (float)lb.y,
+                                   img_w, img_h, false, predicted_len);
+        } else if (!rb_ok && lt_ok && lb_ok && rt_ok) {
+            predict_reference_tick(&rb,
+                                   (float)rt.corner_x + (float)lb.corner_x - (float)lt.corner_x,
+                                   (float)rt.y + (float)lb.y - (float)lt.y,
+                                   img_w, img_h, false, predicted_len);
+        } else if (!lb_ok && lt_ok && rt_ok && rb_ok) {
+            predict_reference_tick(&lb,
+                                   (float)lt.corner_x + (float)rb.corner_x - (float)rt.corner_x,
+                                   (float)lt.y + (float)rb.y - (float)rt.y,
+                                   img_w, img_h, true, predicted_len);
+        }
     }
 
     if (rt.corner_x <= lt.corner_x + img_w / 3 ||
