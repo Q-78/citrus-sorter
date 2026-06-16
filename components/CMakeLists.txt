@@ -1,10 +1,12 @@
 set(src_dirs
+            CALIBRATION
             CAMERA
             FRUIT_DETECT
             M0_UART
             LED)
 
 set(include_dirs
+            CALIBRATION
             CAMERA
             FRUIT_DETECT
             M0_UART

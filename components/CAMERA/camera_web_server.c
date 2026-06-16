@@ -86,12 +86,27 @@ static esp_err_t send_detection_json(httpd_req_t *req,
     char buf[512];
     int len = snprintf(buf, sizeof(buf),
                        "{\"image_width\":%u,\"image_height\":%u,\"count\":%u,"
+                       "\"board\":{\"found\":%s,\"center_x\":%u,\"center_y\":%u,"
+                       "\"bbox_x\":%u,\"bbox_y\":%u,\"bbox_w\":%u,\"bbox_h\":%u,"
+                       "\"tl_x\":%.2f,\"tl_y\":%.2f,\"tr_x\":%.2f,\"tr_y\":%.2f,"
+                       "\"br_x\":%.2f,\"br_y\":%.2f,\"bl_x\":%.2f,\"bl_y\":%.2f,"
+                       "\"area_px\":%lu},"
                        "\"uart\":{\"header\":\"0xAA\",\"has_fruit\":%u,\"grade\":%u,"
-                       "\"x\":%u,\"y\":%u},"
+                       "\"x\":%.2f,\"y\":%.2f,\"relative_valid\":%s},"
                        "\"fruits\":[",
                        result->image_width, result->image_height, result->count,
+                       result->board.found ? "true" : "false",
+                       result->board.center_x, result->board.center_y,
+                       result->board.bbox_x, result->board.bbox_y,
+                       result->board.bbox_w, result->board.bbox_h,
+                       result->board.tl_x, result->board.tl_y,
+                       result->board.tr_x, result->board.tr_y,
+                       result->board.br_x, result->board.br_y,
+                       result->board.bl_x, result->board.bl_y,
+                       (unsigned long)result->board.area_px,
                        payload->has_fruit, payload->grade,
-                       payload->x, payload->y);
+                       payload->x, payload->y,
+                       payload->world_valid ? "true" : "false");
     esp_err_t err = httpd_resp_send_chunk(req, buf, len);
     if (err != ESP_OK) {
         return err;
@@ -99,13 +114,28 @@ static esp_err_t send_detection_json(httpd_req_t *req,
 
     for (uint8_t i = 0; i < result->count; i++) {
         const fruit_info_t *f = &result->fruits[i];
+        float relative_x = 0.0f;
+        float relative_y = 0.0f;
+        bool relative_valid = fruit_detect_board_relative_coord(&result->board,
+                                                                f->center_x,
+                                                                f->center_y,
+                                                                &relative_x,
+                                                                &relative_y);
+        uint16_t x_min = f->bbox_x;
+        uint16_t x_max = f->bbox_x + f->bbox_w - 1;
+        uint16_t y_min = f->bbox_y;
+        uint16_t y_max = f->bbox_y + f->bbox_h - 1;
         len = snprintf(buf, sizeof(buf),
                        "%s{\"center_x\":%u,\"center_y\":%u,\"diameter_px\":%u,"
                        "\"bbox_x\":%u,\"bbox_y\":%u,\"bbox_w\":%u,\"bbox_h\":%u,"
+                       "\"x_min\":%u,\"x_max\":%u,\"y_min\":%u,\"y_max\":%u,"
+                       "\"relative_valid\":%s,\"relative_x\":%.2f,\"relative_y\":%.2f,"
                        "\"area_px\":%lu,\"size_grade\":%u,\"grade_label\":\"%s\"}",
                        i == 0 ? "" : ",",
                        f->center_x, f->center_y, f->diameter_px,
                        f->bbox_x, f->bbox_y, f->bbox_w, f->bbox_h,
+                       x_min, x_max, y_min, y_max,
+                       relative_valid ? "true" : "false", relative_x, relative_y,
                        (unsigned long)f->area_px,
                        (unsigned int)f->size_grade,
                        fruit_grade_label(f->size_grade));
@@ -182,8 +212,9 @@ static esp_err_t index_handler(httpd_req_t *req)
         "<div class='cards'><div class='card'><div class='label'>Fruits Found</div><div class='value' id='count'>0</div></div>"
         "<div class='card'><div class='label'>Image Size</div><div class='value' id='size'>--</div></div>"
         "<div class='card'><div class='label'>Detection</div><div class='value' id='status'>--</div></div>"
+        "<div class='card'><div class='label'>Reference</div><div class='value' id='boardstatus'>--</div></div>"
         "<div class='card'><div class='label'>M0 Frame</div><div class='value' id='m0frame'>--</div></div></div>"
-        "<div class='card'><div class='label'>M0 Coordinates</div><div id='m0coords' style='font-size:14px;margin-top:6px;line-height:1.7'></div></div>"
+        "<div class='card'><div class='label'>Reference Relative Coordinates</div><div id='m0coords' style='font-size:14px;margin-top:6px;line-height:1.7'></div></div>"
         "<div id='table'></div><script>const detectOk=";
 
     res = send_text_chunk(req, page_start);
@@ -218,7 +249,10 @@ static esp_err_t index_handler(httpd_req_t *req)
         "const img=new Image();img.onload=function(){cv.width=img.naturalWidth;cv.height=img.naturalHeight;"
         "ctx.drawImage(img,0,0);drawOverlay();fillInfo();};img.src=imageSrc;"
         "function gradeClass(g){return g===1?'large':'small'}"
-        "function drawOverlay(){for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];"
+        "function drawOverlay(){const b=data.board;if(b.found){ctx.strokeStyle='#c9894b';ctx.lineWidth=3;ctx.beginPath();"
+        "ctx.moveTo(b.tl_x,b.tl_y);ctx.lineTo(b.tr_x,b.tr_y);ctx.lineTo(b.br_x,b.br_y);ctx.lineTo(b.bl_x,b.bl_y);ctx.closePath();ctx.stroke();"
+        "ctx.font='bold 12px Arial';ctx.fillStyle='#c9894b';ctx.fillText('reference',b.tl_x+4,Math.max(12,b.tl_y-6));}"
+        "for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];"
         "const cls=gradeClass(f.size_grade);const color=cls==='large'?'#ff6b6b':'#7bdff2';"
         "ctx.strokeStyle=color;ctx.lineWidth=2;ctx.strokeRect(f.bbox_x,f.bbox_y,f.bbox_w,f.bbox_h);"
         "ctx.beginPath();ctx.arc(f.center_x,f.center_y,Math.max(4,f.diameter_px/2),0,Math.PI*2);ctx.stroke();"
@@ -230,13 +264,17 @@ static esp_err_t index_handler(httpd_req_t *req)
         "function fillInfo(){document.getElementById('count').textContent=data.count;"
         "document.getElementById('size').textContent=data.image_width+' x '+data.image_height;"
         "const s=document.getElementById('status');s.textContent=detectOk?'OK':'Decode Error';s.className='value '+(detectOk?'ok':'warn');"
-        "const u=data.uart;document.getElementById('m0frame').textContent=u.header+' '+u.has_fruit+' '+u.grade+' '+u.x+' '+u.y;"
+        "const b=data.board;document.getElementById('boardstatus').textContent=b.found?(b.bbox_w+' x '+b.bbox_h):'--';"
+        "const u=data.uart;document.getElementById('m0frame').textContent=u.header+' '+u.has_fruit+' '+u.grade+' '+u.x.toFixed(2)+' '+u.y.toFixed(2);"
         "document.getElementById('m0coords').innerHTML='has_fruit: '+u.has_fruit+' &nbsp; grade: '+u.grade+'<br>'"
-        "+'x: '+u.x+' &nbsp; y: '+u.y;"
+        "+'sent x: '+u.x.toFixed(2)+' &nbsp; sent y: '+u.y.toFixed(2)+'<br>'"
+        "+'reference: '+(b.found?('TL '+b.tl_x.toFixed(1)+','+b.tl_y.toFixed(1)+' TR '+b.tr_x.toFixed(1)+','+b.tr_y.toFixed(1)+'<br>BL '+b.bl_x.toFixed(1)+','+b.bl_y.toFixed(1)+' BR '+b.br_x.toFixed(1)+','+b.br_y.toFixed(1)):'--');"
         "let html='';if(data.fruits.length===0){html='<div class=\"empty\">No citrus-colored fruit region found.</div>';}else{"
-        "html='<table><thead><tr><th>#</th><th>Center</th><th>Diameter</th><th>Area</th><th>Box</th><th>Grade</th></tr></thead><tbody>';"
+        "html='<table><thead><tr><th>#</th><th>Pixel Center</th><th>Bounds</th><th>Reference Relative</th><th>Diameter</th><th>Area</th><th>Box</th><th>Grade</th></tr></thead><tbody>';"
         "for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];const cls=gradeClass(f.size_grade);"
-        "html+='<tr><td>'+(i+1)+'</td><td>'+f.center_x+', '+f.center_y+'</td><td>'+f.diameter_px+' px</td><td>'+f.area_px+' px</td><td>'+f.bbox_w+' x '+f.bbox_h+'</td><td class=\"'+cls+'\">'+f.grade_label+'</td></tr>';}"
+        "const rel=f.relative_valid?(f.relative_x.toFixed(2)+', '+f.relative_y.toFixed(2)):'--';"
+        "const bounds='x '+f.x_min+'..'+f.x_max+'<br>y '+f.y_min+'..'+f.y_max;"
+        "html+='<tr><td>'+(i+1)+'</td><td>'+f.center_x+', '+f.center_y+'</td><td>'+bounds+'</td><td>'+rel+'</td><td>'+f.diameter_px+' px</td><td>'+f.area_px+' px</td><td>'+f.bbox_w+' x '+f.bbox_h+'</td><td class=\"'+cls+'\">'+f.grade_label+'</td></tr>';}"
         "html+='</tbody></table>';}document.getElementById('table').innerHTML=html;}"
         "const autoRefresh=";
 

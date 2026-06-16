@@ -61,9 +61,9 @@ static camera_config_t camera_config = {
     .pixel_format = PIXFORMAT_JPEG,
 
     // 【修改】调试阶段先用 VGA/QVGA，确认采集成功后再提高到 UXGA。
-    .frame_size = FRAMESIZE_QVGA,
+    .frame_size = FRAMESIZE_VGA,
 
-    .jpeg_quality = 12,
+    .jpeg_quality = 10,
     .fb_count = 1,
     .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
     .fb_location = CAMERA_FB_IN_PSRAM,
@@ -124,11 +124,13 @@ esp_err_t camera_init(void)
 
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_framesize(s, FRAMESIZE_QVGA);
-        s->set_quality(s, 12);
+        s->set_framesize(s, FRAMESIZE_VGA);
+        s->set_quality(s, 10);
         s->set_brightness(s, 0);
-        s->set_contrast(s, 0);
+        s->set_contrast(s, 1);
         s->set_saturation(s, 0);
+        s->set_sharpness(s, 2);
+        s->set_denoise(s, 1);
     }
 
     ESP_LOGI(TAG, "Camera init OK");
