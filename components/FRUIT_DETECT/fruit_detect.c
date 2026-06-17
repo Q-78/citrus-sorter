@@ -14,7 +14,7 @@ static const char *TAG = "fruit_detect";
 #define MAX_LABELS 512
 #define MIN_BLOB_AREA 350
 #define MIN_DIAMETER_PX 35
-#define LARGE_MIN_REFERENCE_RATIO_X1000 400U
+#define LARGE_MIN_REFERENCE_RATIO_X1000 440U
 
 typedef struct {
     uint32_t sum_x;

@@ -227,7 +227,7 @@ static esp_err_t index_handler(httpd_req_t *req)
         ".ok{color:#55d68b}.warn{color:#ffbd5a}.small{color:#7bdff2}.large{color:#ff6b6b}"
         "</style></head><body><div class='bar'><h2>Citrus Sorter Debug</h2>"
         "<div class='actions'><a class='btn' href='/'>Refresh Capture</a>"
-        "<a class='btn secondary' href='/?auto=1'>Auto Refresh</a>"
+        "<a class='btn secondary' href='/?auto=1'>Auto Refresh (3s)</a>"
         "<a class='btn secondary' href='/capture'>Raw JPEG</a>"
         "<a class='btn secondary' href='/stream'>MJPEG Stream</a></div></div>"
         "<div class='wrap'><div class='stage'><canvas id='view'></canvas></div>"
@@ -310,7 +310,7 @@ static esp_err_t index_handler(httpd_req_t *req)
     }
 
     const char *page_finish =
-        ";if(autoRefresh){setInterval(refreshSnapshot,1200);}"
+        ";if(autoRefresh){setInterval(refreshSnapshot,3000);}"
         "</script></div></body></html>";
 
     if (res == ESP_OK) {
