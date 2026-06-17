@@ -116,10 +116,7 @@ esp_err_t m0_uart_build_payload(const fruit_detect_result_t *result, m0_uart_pay
 
     if (payload->has_fruit) {
         const fruit_info_t *fruit = &result->fruits[0];
-        uint16_t x_min = fruit->bbox_x;
-        uint16_t x_max = fruit->bbox_x + fruit->bbox_w - 1;
-
-        payload->grade = (x_max - x_min > 50) ? 1 : 0;
+        payload->grade = fruit->size_grade == FRUIT_GRADE_LARGE ? 1 : 0;
         payload->world_valid = fruit_detect_board_relative_coord(&result->board,
                                                                   fruit->center_x,
                                                                   fruit->center_y,
