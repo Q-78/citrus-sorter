@@ -31,6 +31,7 @@ static void uf_init(uint16_t *parent, uint16_t count);
 static uint16_t uf_find(uint16_t *parent, uint16_t x);
 static void uf_union(uint16_t *parent, uint16_t a, uint16_t b);
 static void stats_add_pixel(component_stats_t *s, uint16_t x, uint16_t y);
+static float distance_f(float ax, float ay, float bx, float by);
 
 static void *detect_malloc(size_t size)
 {
@@ -90,10 +91,13 @@ static int rgb_hue_deg(uint8_t r, uint8_t g, uint8_t b)
     return hue;
 }
 
+#if 0
+/* Black-line reference detection is disabled; blue dots are the only board reference. */
 static uint8_t rgb_luma(uint8_t r, uint8_t g, uint8_t b)
 {
     return (uint8_t)(((int)r * 30 + (int)g * 59 + (int)b * 11) / 100);
 }
+#endif
 
 static bool is_citrus_pixel(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -119,6 +123,8 @@ static bool is_citrus_pixel(uint8_t r, uint8_t g, uint8_t b)
            g * 100 <= r * 120;
 }
 
+#if 0
+/* Black-line reference detection is disabled; blue dots are the only board reference. */
 static bool is_black_reference_pixel(uint8_t r, uint8_t g, uint8_t b)
 {
     int maxc = max3(r, g, b);
@@ -133,6 +139,31 @@ static bool is_black_reference_pixel(uint8_t r, uint8_t g, uint8_t b)
     int saturation = delta * 255 / maxc;
 
     return saturation <= 155;
+}
+#endif
+
+static bool is_blue_reference_pixel(uint8_t r, uint8_t g, uint8_t b)
+{
+    int maxc = max3(r, g, b);
+    int minc = min3(r, g, b);
+    int delta = maxc - minc;
+
+    if (maxc < 55 || delta < 18 || b < 65) {
+        return false;
+    }
+
+    int saturation = delta * 255 / maxc;
+    int hue = rgb_hue_deg(r, g, b);
+
+    if (b < r + 10 || b + 12 < g) {
+        return false;
+    }
+
+    if (saturation >= 40 && hue >= 175 && hue <= 255) {
+        return true;
+    }
+
+    return maxc >= 165 && b >= r + 18 && b + 8 >= g;
 }
 
 static void open_mask_3x3(uint8_t *mask, uint8_t *scratch, uint16_t width, uint16_t height)
@@ -164,6 +195,40 @@ static void open_mask_3x3(uint8_t *mask, uint8_t *scratch, uint16_t width, uint1
                     mask[(size_t)(y + dy) * width + (x + dx)] = 1;
                 }
             }
+        }
+    }
+}
+
+static void close_mask_3x3(uint8_t *mask, uint8_t *scratch, uint16_t width, uint16_t height)
+{
+    memset(scratch, 0, (size_t)width * height);
+
+    for (uint16_t y = 1; y + 1 < height; y++) {
+        for (uint16_t x = 1; x + 1 < width; x++) {
+            bool hit = false;
+            for (int dy = -1; dy <= 1 && !hit; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    if (mask[(size_t)(y + dy) * width + (x + dx)]) {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+            scratch[(size_t)y * width + x] = hit ? 1 : 0;
+        }
+    }
+
+    memset(mask, 0, (size_t)width * height);
+
+    for (uint16_t y = 1; y + 1 < height; y++) {
+        for (uint16_t x = 1; x + 1 < width; x++) {
+            uint8_t count = 0;
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    count += scratch[(size_t)(y + dy) * width + (x + dx)] ? 1 : 0;
+                }
+            }
+            mask[(size_t)y * width + x] = count >= 5 ? 1 : 0;
         }
     }
 }
@@ -247,6 +312,8 @@ static void update_board_bbox_from_corners(board_info_t *board,
     board->center_y = (uint16_t)(board->bbox_y + board->bbox_h / 2);
 }
 
+#if 0
+/* Black-line reference fitting is disabled; blue dots are the only board reference. */
 static bool fit_vertical_line_x_at_y(const uint8_t *mask,
                                      uint16_t img_w,
                                      uint16_t img_h,
@@ -691,12 +758,14 @@ static uint16_t reference_line_support(const uint8_t *mask,
     return support;
 }
 
-static bool find_reference_dot_near(const uint8_t *mask,
-                                    uint16_t img_w,
-                                    uint16_t img_h,
-                                    float rough_x,
-                                    float rough_y,
-                                    reference_dot_t *dot)
+static bool find_reference_dot_near_limited(const uint8_t *mask,
+                                            uint16_t img_w,
+                                            uint16_t img_h,
+                                            float rough_x,
+                                            float rough_y,
+                                            int max_search_rx,
+                                            int max_search_ry,
+                                            reference_dot_t *dot)
 {
     if (!mask || !dot) {
         return false;
@@ -717,14 +786,14 @@ static bool find_reference_dot_near(const uint8_t *mask,
     if (search_rx < 28) {
         search_rx = 28;
     }
-    if (search_rx > 80) {
-        search_rx = 80;
+    if (search_rx > max_search_rx) {
+        search_rx = max_search_rx;
     }
     if (search_ry < 24) {
         search_ry = 24;
     }
-    if (search_ry > 70) {
-        search_ry = 70;
+    if (search_ry > max_search_ry) {
+        search_ry = max_search_ry;
     }
 
     int center_x = (int)lroundf(rough_x);
@@ -803,6 +872,53 @@ static bool find_reference_dot_near(const uint8_t *mask,
     dot->y = (float)best_y;
     dot->score = best_count;
     dot->radius = (uint16_t)dot_r;
+    return true;
+}
+
+static bool find_reference_dot_near(const uint8_t *mask,
+                                    uint16_t img_w,
+                                    uint16_t img_h,
+                                    float rough_x,
+                                    float rough_y,
+                                    reference_dot_t *dot)
+{
+    return find_reference_dot_near_limited(mask, img_w, img_h,
+                                           rough_x, rough_y,
+                                           80, 70, dot);
+}
+
+static bool find_reference_dot_near_wide(const uint8_t *mask,
+                                         uint16_t img_w,
+                                         uint16_t img_h,
+                                         float rough_x,
+                                         float rough_y,
+                                         reference_dot_t *dot)
+{
+    return find_reference_dot_near_limited(mask, img_w, img_h,
+                                           rough_x, rough_y,
+                                           180, 140, dot);
+}
+
+static bool refine_predicted_reference_tick(const uint8_t *mask,
+                                            uint16_t img_w,
+                                            uint16_t img_h,
+                                            bool corner_on_left,
+                                            horizontal_tick_t *tick)
+{
+    if (!tick || !tick->found) {
+        return false;
+    }
+
+    reference_dot_t dot;
+    if (!find_reference_dot_near_wide(mask, img_w, img_h,
+                                      (float)tick->corner_x,
+                                      (float)tick->y,
+                                      &dot)) {
+        return false;
+    }
+
+    uint16_t length = tick->length;
+    predict_reference_tick(tick, dot.x, dot.y, img_w, img_h, corner_on_left, length);
     return true;
 }
 
@@ -1208,6 +1324,109 @@ static void blend_reference_dot(const reference_dot_t *dot,
     *y = dot->y * 0.82f + *y * 0.18f;
 }
 
+static bool fit_reference_vertical_line_between_points(const uint8_t *mask,
+                                                       uint16_t img_w,
+                                                       uint16_t img_h,
+                                                       float ax,
+                                                       float ay,
+                                                       float bx,
+                                                       float by,
+                                                       bool use_left_edge,
+                                                       line_x_fit_t *line)
+{
+    if (!line) {
+        return false;
+    }
+
+    float y_top = ay < by ? ay : by;
+    float y_bottom = ay > by ? ay : by;
+    float rough_x = (ax + bx) * 0.5f;
+    if (y_bottom <= y_top + 8.0f) {
+        return false;
+    }
+
+    (void)use_left_edge;
+    return fit_reference_vertical_line(mask, img_w, img_h,
+                                       clamp_i32_to_u16((int32_t)lroundf(rough_x), 0, img_w - 1),
+                                       clamp_i32_to_u16((int32_t)floorf(y_top), 0, img_h - 1),
+                                       clamp_i32_to_u16((int32_t)ceilf(y_bottom), 0, img_h - 1),
+                                       line);
+}
+
+static void refine_reference_corners_from_edges(const uint8_t *mask,
+                                                uint16_t img_w,
+                                                uint16_t img_h,
+                                                float *tl_x,
+                                                float *tl_y,
+                                                float *tr_x,
+                                                float *tr_y,
+                                                float *br_x,
+                                                float *br_y,
+                                                float *bl_x,
+                                                float *bl_y)
+{
+    if (!mask || !tl_x || !tl_y || !tr_x || !tr_y ||
+        !br_x || !br_y || !bl_x || !bl_y) {
+        return;
+    }
+
+    uint16_t top_x0 = clamp_i32_to_u16((int32_t)floorf(fminf(*tl_x, *tr_x)), 0, img_w - 1);
+    uint16_t top_x1 = clamp_i32_to_u16((int32_t)ceilf(fmaxf(*tl_x, *tr_x)), 0, img_w - 1);
+    uint16_t bottom_x0 = clamp_i32_to_u16((int32_t)floorf(fminf(*bl_x, *br_x)), 0, img_w - 1);
+    uint16_t bottom_x1 = clamp_i32_to_u16((int32_t)ceilf(fmaxf(*bl_x, *br_x)), 0, img_w - 1);
+
+    line_y_fit_t top;
+    line_y_fit_t bottom;
+    line_x_fit_t left;
+    line_x_fit_t right;
+
+    bool top_ok = fit_reference_horizontal_line_between(mask, img_w, img_h,
+                                                        top_x0, top_x1,
+                                                        clamp_i32_to_u16((int32_t)lroundf(*tl_y), 0, img_h - 1),
+                                                        clamp_i32_to_u16((int32_t)lroundf(*tr_y), 0, img_h - 1),
+                                                        &top);
+    bool bottom_ok = fit_reference_horizontal_line_between(mask, img_w, img_h,
+                                                           bottom_x0, bottom_x1,
+                                                           clamp_i32_to_u16((int32_t)lroundf(*bl_y), 0, img_h - 1),
+                                                           clamp_i32_to_u16((int32_t)lroundf(*br_y), 0, img_h - 1),
+                                                           &bottom);
+    bool left_ok = fit_reference_vertical_line_between_points(mask, img_w, img_h,
+                                                              *tl_x, *tl_y,
+                                                              *bl_x, *bl_y,
+                                                              true, &left);
+    bool right_ok = fit_reference_vertical_line_between_points(mask, img_w, img_h,
+                                                               *tr_x, *tr_y,
+                                                               *br_x, *br_y,
+                                                               false, &right);
+
+    float ix;
+    float iy;
+    if (top_ok && left_ok &&
+        intersect_reference_lines(&top, &left, &ix, &iy) &&
+        reference_point_reasonable(ix, iy, img_w, img_h)) {
+        *tl_x = ix;
+        *tl_y = iy;
+    }
+    if (top_ok && right_ok &&
+        intersect_reference_lines(&top, &right, &ix, &iy) &&
+        reference_point_reasonable(ix, iy, img_w, img_h)) {
+        *tr_x = ix;
+        *tr_y = iy;
+    }
+    if (bottom_ok && right_ok &&
+        intersect_reference_lines(&bottom, &right, &ix, &iy) &&
+        reference_point_reasonable(ix, iy, img_w, img_h)) {
+        *br_x = ix;
+        *br_y = iy;
+    }
+    if (bottom_ok && left_ok &&
+        intersect_reference_lines(&bottom, &left, &ix, &iy) &&
+        reference_point_reasonable(ix, iy, img_w, img_h)) {
+        *bl_x = ix;
+        *bl_y = iy;
+    }
+}
+
 static bool detect_reference_from_ticks(const uint8_t *mask,
                                         uint16_t img_w,
                                         uint16_t img_h,
@@ -1241,6 +1460,11 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
         return false;
     }
 
+    bool lt_predicted = false;
+    bool lb_predicted = false;
+    bool rt_predicted = false;
+    bool rb_predicted = false;
+
     if (found_ticks == 3) {
         uint16_t predicted_len = average_reference_tick_length(&lt, &lb, &rt, &rb, img_w);
         if (!lt_ok && rt_ok && lb_ok && rb_ok) {
@@ -1248,21 +1472,35 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
                                    (float)rt.corner_x + (float)lb.corner_x - (float)rb.corner_x,
                                    (float)rt.y + (float)lb.y - (float)rb.y,
                                    img_w, img_h, true, predicted_len);
+            lt_predicted = true;
         } else if (!rt_ok && lt_ok && lb_ok && rb_ok) {
             predict_reference_tick(&rt,
                                    (float)lt.corner_x + (float)rb.corner_x - (float)lb.corner_x,
                                    (float)lt.y + (float)rb.y - (float)lb.y,
                                    img_w, img_h, false, predicted_len);
+            rt_predicted = true;
         } else if (!rb_ok && lt_ok && lb_ok && rt_ok) {
             predict_reference_tick(&rb,
                                    (float)rt.corner_x + (float)lb.corner_x - (float)lt.corner_x,
                                    (float)rt.y + (float)lb.y - (float)lt.y,
                                    img_w, img_h, false, predicted_len);
+            rb_predicted = true;
         } else if (!lb_ok && lt_ok && rt_ok && rb_ok) {
             predict_reference_tick(&lb,
                                    (float)lt.corner_x + (float)rb.corner_x - (float)rt.corner_x,
                                    (float)lt.y + (float)rb.y - (float)rt.y,
                                    img_w, img_h, true, predicted_len);
+            lb_predicted = true;
+        }
+
+        if (lt_predicted) {
+            refine_predicted_reference_tick(mask, img_w, img_h, true, &lt);
+        } else if (rt_predicted) {
+            refine_predicted_reference_tick(mask, img_w, img_h, false, &rt);
+        } else if (rb_predicted) {
+            refine_predicted_reference_tick(mask, img_w, img_h, false, &rb);
+        } else if (lb_predicted) {
+            refine_predicted_reference_tick(mask, img_w, img_h, true, &lb);
         }
     }
 
@@ -1292,13 +1530,17 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
     bool right_vertical_ok = fit_reference_vertical_line(mask, img_w, img_h,
                                                          right_center_x, rt.y, rb.y,
                                                          &right_vertical);
-    bool lt_horizontal_ok = fit_reference_horizontal_line(mask, img_w, img_h,
+    bool lt_horizontal_ok = !lt_predicted &&
+                            fit_reference_horizontal_line(mask, img_w, img_h,
                                                           &lt, 1, &lt_horizontal);
-    bool lb_horizontal_ok = fit_reference_horizontal_line(mask, img_w, img_h,
+    bool lb_horizontal_ok = !lb_predicted &&
+                            fit_reference_horizontal_line(mask, img_w, img_h,
                                                           &lb, 1, &lb_horizontal);
-    bool rt_horizontal_ok = fit_reference_horizontal_line(mask, img_w, img_h,
+    bool rt_horizontal_ok = !rt_predicted &&
+                            fit_reference_horizontal_line(mask, img_w, img_h,
                                                           &rt, -1, &rt_horizontal);
-    bool rb_horizontal_ok = fit_reference_horizontal_line(mask, img_w, img_h,
+    bool rb_horizontal_ok = !rb_predicted &&
+                            fit_reference_horizontal_line(mask, img_w, img_h,
                                                           &rb, -1, &rb_horizontal);
 
     if (left_vertical_ok) {
@@ -1357,15 +1599,29 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
     reference_dot_t tr_dot;
     reference_dot_t br_dot;
     reference_dot_t bl_dot;
-    find_reference_dot_near(mask, img_w, img_h, tl_x, tl_y, &tl_dot);
-    find_reference_dot_near(mask, img_w, img_h, tr_x, tr_y, &tr_dot);
-    find_reference_dot_near(mask, img_w, img_h, br_x, br_y, &br_dot);
-    find_reference_dot_near(mask, img_w, img_h, bl_x, bl_y, &bl_dot);
+    if (!find_reference_dot_near(mask, img_w, img_h, tl_x, tl_y, &tl_dot)) {
+        find_reference_dot_near_wide(mask, img_w, img_h, tl_x, tl_y, &tl_dot);
+    }
+    if (!find_reference_dot_near(mask, img_w, img_h, tr_x, tr_y, &tr_dot)) {
+        find_reference_dot_near_wide(mask, img_w, img_h, tr_x, tr_y, &tr_dot);
+    }
+    if (!find_reference_dot_near(mask, img_w, img_h, br_x, br_y, &br_dot)) {
+        find_reference_dot_near_wide(mask, img_w, img_h, br_x, br_y, &br_dot);
+    }
+    if (!find_reference_dot_near(mask, img_w, img_h, bl_x, bl_y, &bl_dot)) {
+        find_reference_dot_near_wide(mask, img_w, img_h, bl_x, bl_y, &bl_dot);
+    }
 
     blend_reference_dot(&tl_dot, &tl_x, &tl_y);
     blend_reference_dot(&tr_dot, &tr_x, &tr_y);
     blend_reference_dot(&br_dot, &br_x, &br_y);
     blend_reference_dot(&bl_dot, &bl_x, &bl_y);
+
+    refine_reference_corners_from_edges(mask, img_w, img_h,
+                                        &tl_x, &tl_y,
+                                        &tr_x, &tr_y,
+                                        &br_x, &br_y,
+                                        &bl_x, &bl_y);
 
     board->found = true;
     board->tl_x = tl_x;
@@ -1377,9 +1633,11 @@ static bool detect_reference_from_ticks(const uint8_t *mask,
     board->bl_x = bl_x;
     board->bl_y = bl_y;
     board->area_px = lt.length + lb.length + rt.length + rb.length;
+    board->reference_mode = BOARD_REFERENCE_NONE;
     update_board_bbox_from_corners(board, img_w, img_h);
     return true;
 }
+#endif
 
 static float distance_f(float ax, float ay, float bx, float by)
 {
@@ -1436,6 +1694,400 @@ static bool solve_8x8(float a[8][9], float out[8])
         out[i] = a[i][8];
     }
     return true;
+}
+
+typedef struct {
+    bool found;
+    float x;
+    float y;
+    uint16_t min_x;
+    uint16_t max_x;
+    uint16_t min_y;
+    uint16_t max_y;
+    uint32_t area;
+    uint32_t score;
+} blue_marker_t;
+
+static float cross_points(float ax, float ay, float bx, float by, float cx, float cy)
+{
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+static float quad_area2(const board_info_t *board)
+{
+    float area = 0.0f;
+    area += board->tl_x * board->tr_y - board->tl_y * board->tr_x;
+    area += board->tr_x * board->br_y - board->tr_y * board->br_x;
+    area += board->br_x * board->bl_y - board->br_y * board->bl_x;
+    area += board->bl_x * board->tl_y - board->bl_y * board->tl_x;
+    return fabsf(area);
+}
+
+static bool blue_marker_board_geometry_ok(const board_info_t *board,
+                                          uint16_t img_w,
+                                          uint16_t img_h)
+{
+    float c1 = cross_points(board->tl_x, board->tl_y, board->tr_x, board->tr_y,
+                            board->br_x, board->br_y);
+    float c2 = cross_points(board->tr_x, board->tr_y, board->br_x, board->br_y,
+                            board->bl_x, board->bl_y);
+    float c3 = cross_points(board->br_x, board->br_y, board->bl_x, board->bl_y,
+                            board->tl_x, board->tl_y);
+    float c4 = cross_points(board->bl_x, board->bl_y, board->tl_x, board->tl_y,
+                            board->tr_x, board->tr_y);
+    bool all_pos = c1 > 0.0f && c2 > 0.0f && c3 > 0.0f && c4 > 0.0f;
+    bool all_neg = c1 < 0.0f && c2 < 0.0f && c3 < 0.0f && c4 < 0.0f;
+    if (!all_pos && !all_neg) {
+        return false;
+    }
+
+    float top_w = distance_f(board->tl_x, board->tl_y, board->tr_x, board->tr_y);
+    float bottom_w = distance_f(board->bl_x, board->bl_y, board->br_x, board->br_y);
+    float left_h = distance_f(board->tl_x, board->tl_y, board->bl_x, board->bl_y);
+    float right_h = distance_f(board->tr_x, board->tr_y, board->br_x, board->br_y);
+    float min_side = fminf(fminf(top_w, bottom_w), fminf(left_h, right_h));
+    if (min_side < 35.0f) {
+        return false;
+    }
+
+    float width_ratio = fmaxf(top_w, bottom_w) / fmaxf(1.0f, fminf(top_w, bottom_w));
+    float height_ratio = fmaxf(left_h, right_h) / fmaxf(1.0f, fminf(left_h, right_h));
+    if (width_ratio > 1.55f || height_ratio > 1.45f) {
+        return false;
+    }
+
+    float avg_width = (top_w + bottom_w) * 0.5f;
+    float avg_height = (left_h + right_h) * 0.5f;
+    float aspect = avg_width / fmaxf(1.0f, avg_height);
+    if (aspect < 1.45f || aspect > 4.2f) {
+        return false;
+    }
+
+    float area2 = quad_area2(board);
+    float min_area2 = (float)((uint32_t)img_w * img_h) * 0.06f;
+    return area2 >= min_area2;
+}
+
+static bool blue_marker_candidate_in_safe_area(const component_stats_t *s,
+                                               float cx,
+                                               float cy,
+                                               uint16_t img_w,
+                                               uint16_t img_h)
+{
+    if (!s) {
+        return false;
+    }
+
+    uint16_t margin_x = img_w / 45;
+    uint16_t margin_y = img_h / 45;
+    if (margin_x < 18) {
+        margin_x = 18;
+    }
+    if (margin_y < 14) {
+        margin_y = 14;
+    }
+
+    if (s->min_x <= 1 || s->min_y <= 1 ||
+        s->max_x + 2 >= img_w || s->max_y + 2 >= img_h) {
+        return false;
+    }
+
+    return cx >= (float)margin_x &&
+           cy >= (float)margin_y &&
+           cx <= (float)(img_w - 1 - margin_x) &&
+           cy <= (float)(img_h - 1 - margin_y);
+}
+
+static float blue_marker_board_score(const board_info_t *board,
+                                     const blue_marker_t markers[4])
+{
+    float top_w = distance_f(board->tl_x, board->tl_y, board->tr_x, board->tr_y);
+    float bottom_w = distance_f(board->bl_x, board->bl_y, board->br_x, board->br_y);
+    float left_h = distance_f(board->tl_x, board->tl_y, board->bl_x, board->bl_y);
+    float right_h = distance_f(board->tr_x, board->tr_y, board->br_x, board->br_y);
+    float width_balance = fabsf(top_w - bottom_w) / fmaxf(1.0f, fmaxf(top_w, bottom_w));
+    float height_balance = fabsf(left_h - right_h) / fmaxf(1.0f, fmaxf(left_h, right_h));
+    uint32_t marker_score = markers[0].score + markers[1].score +
+                            markers[2].score + markers[3].score;
+    return quad_area2(board) + (float)marker_score * 12.0f -
+           (width_balance + height_balance) * 9000.0f;
+}
+
+static bool assign_blue_marker_corners(const blue_marker_t markers[4],
+                                       board_info_t *board)
+{
+    if (!markers || !board) {
+        return false;
+    }
+
+    uint8_t tl = 0;
+    uint8_t br = 0;
+    uint8_t tr = 0;
+    uint8_t bl = 0;
+    float min_sum = markers[0].x + markers[0].y;
+    float max_sum = min_sum;
+    float max_diff = markers[0].x - markers[0].y;
+    float min_diff = max_diff;
+
+    for (uint8_t i = 1; i < 4; i++) {
+        float sum = markers[i].x + markers[i].y;
+        float diff = markers[i].x - markers[i].y;
+        if (sum < min_sum) {
+            min_sum = sum;
+            tl = i;
+        }
+        if (sum > max_sum) {
+            max_sum = sum;
+            br = i;
+        }
+        if (diff > max_diff) {
+            max_diff = diff;
+            tr = i;
+        }
+        if (diff < min_diff) {
+            min_diff = diff;
+            bl = i;
+        }
+    }
+
+    if (tl == tr || tl == br || tl == bl || tr == br || tr == bl || br == bl) {
+        return false;
+    }
+
+    float top_w = distance_f(markers[tl].x, markers[tl].y, markers[tr].x, markers[tr].y);
+    float bottom_w = distance_f(markers[bl].x, markers[bl].y, markers[br].x, markers[br].y);
+    float left_h = distance_f(markers[tl].x, markers[tl].y, markers[bl].x, markers[bl].y);
+    float right_h = distance_f(markers[tr].x, markers[tr].y, markers[br].x, markers[br].y);
+    if (top_w < 30.0f || bottom_w < 30.0f || left_h < 30.0f || right_h < 30.0f) {
+        return false;
+    }
+
+    board->found = true;
+    board->reference_mode = BOARD_REFERENCE_BLUE_DOTS;
+    board->tl_x = markers[tl].x;
+    board->tl_y = markers[tl].y;
+    board->tr_x = markers[tr].x;
+    board->tr_y = markers[tr].y;
+    board->br_x = markers[br].x;
+    board->br_y = markers[br].y;
+    board->bl_x = markers[bl].x;
+    board->bl_y = markers[bl].y;
+    board->area_px = markers[0].area + markers[1].area + markers[2].area + markers[3].area;
+    return true;
+}
+
+static bool select_blue_marker_board(const blue_marker_t *candidates,
+                                     uint8_t candidate_count,
+                                     uint16_t img_w,
+                                     uint16_t img_h,
+                                     board_info_t *board)
+{
+    if (!candidates || candidate_count < 4 || !board) {
+        return false;
+    }
+
+    bool found = false;
+    float best_score = -1000000000.0f;
+    board_info_t best_board = {0};
+
+    for (uint8_t a = 0; a + 3 < candidate_count; a++) {
+        for (uint8_t b = a + 1; b + 2 < candidate_count; b++) {
+            for (uint8_t c = b + 1; c + 1 < candidate_count; c++) {
+                for (uint8_t d = c + 1; d < candidate_count; d++) {
+                    blue_marker_t quad[4] = {
+                        candidates[a], candidates[b], candidates[c], candidates[d],
+                    };
+                    board_info_t candidate_board = {0};
+                    if (!assign_blue_marker_corners(quad, &candidate_board) ||
+                        !blue_marker_board_geometry_ok(&candidate_board, img_w, img_h)) {
+                        continue;
+                    }
+
+                    float score = blue_marker_board_score(&candidate_board, quad);
+                    if (!found || score > best_score) {
+                        found = true;
+                        best_score = score;
+                        best_board = candidate_board;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+
+    *board = best_board;
+    return true;
+}
+
+static bool detect_board_from_blue_markers(uint8_t *mask,
+                                           uint16_t img_w,
+                                           uint16_t img_h,
+                                           board_info_t *board)
+{
+    if (!mask || !board) {
+        return false;
+    }
+
+    uint16_t *labels = detect_calloc((size_t)img_w * img_h, sizeof(uint16_t));
+    uint16_t *parent = detect_malloc(MAX_LABELS * sizeof(uint16_t));
+    component_stats_t *stats = detect_calloc(MAX_LABELS, sizeof(component_stats_t));
+    if (!labels || !parent || !stats) {
+        free(labels);
+        free(parent);
+        free(stats);
+        return false;
+    }
+
+    uf_init(parent, MAX_LABELS);
+    for (uint16_t i = 0; i < MAX_LABELS; i++) {
+        stats[i].min_x = img_w;
+        stats[i].min_y = img_h;
+    }
+
+    uint16_t next_label = 1;
+    for (uint16_t y = 0; y < img_h; y++) {
+        for (uint16_t x = 0; x < img_w; x++) {
+            size_t idx = (size_t)y * img_w + x;
+            if (!mask[idx]) {
+                continue;
+            }
+
+            uint16_t up = y > 0 ? labels[(size_t)(y - 1) * img_w + x] : 0;
+            uint16_t left = x > 0 ? labels[idx - 1] : 0;
+
+            if (up == 0 && left == 0) {
+                if (next_label < MAX_LABELS) {
+                    labels[idx] = next_label++;
+                }
+            } else if (up != 0 && left != 0) {
+                labels[idx] = up < left ? up : left;
+                if (up != left) {
+                    uf_union(parent, up, left);
+                }
+            } else {
+                labels[idx] = up ? up : left;
+            }
+        }
+    }
+
+    for (uint16_t y = 0; y < img_h; y++) {
+        for (uint16_t x = 0; x < img_w; x++) {
+            size_t idx = (size_t)y * img_w + x;
+            uint16_t raw_label = labels[idx];
+            if (raw_label == 0) {
+                continue;
+            }
+
+            uint16_t root = uf_find(parent, raw_label);
+            labels[idx] = root;
+            stats_add_pixel(&stats[root], x, y);
+        }
+    }
+
+    for (uint16_t y = 0; y < img_h; y++) {
+        for (uint16_t x = 0; x < img_w; x++) {
+            size_t idx = (size_t)y * img_w + x;
+            uint16_t root = labels[idx];
+            if (root == 0) {
+                continue;
+            }
+
+            bool edge = x == 0 || y == 0 || x + 1 == img_w || y + 1 == img_h ||
+                        labels[idx - 1] != root ||
+                        labels[idx + 1] != root ||
+                        labels[(size_t)(y - 1) * img_w + x] != root ||
+                        labels[(size_t)(y + 1) * img_w + x] != root;
+            if (edge) {
+                stats[root].perimeter++;
+            }
+        }
+    }
+
+    blue_marker_t candidates[12] = {0};
+    uint8_t candidate_count = 0;
+    uint32_t min_area = ((uint32_t)img_w * img_h) / 12000U;
+    if (min_area < 10) {
+        min_area = 10;
+    }
+    uint32_t max_area = ((uint32_t)img_w * img_h) / 550U;
+    if (max_area < 80) {
+        max_area = 80;
+    }
+
+    for (uint16_t i = 1; i < next_label; i++) {
+        if (uf_find(parent, i) != i) {
+            continue;
+        }
+
+        component_stats_t *s = &stats[i];
+        if (s->count < min_area || s->count > max_area ||
+            s->perimeter == 0 ||
+            s->min_x > s->max_x || s->min_y > s->max_y) {
+            continue;
+        }
+
+        uint16_t bbox_w = s->max_x - s->min_x + 1;
+        uint16_t bbox_h = s->max_y - s->min_y + 1;
+        uint16_t min_side = bbox_w < bbox_h ? bbox_w : bbox_h;
+        uint16_t max_side = bbox_w > bbox_h ? bbox_w : bbox_h;
+        if (min_side < 4 || max_side * 10 > min_side * 28) {
+            continue;
+        }
+
+        uint32_t circularity100 =
+            (uint32_t)((1256ULL * s->count) / ((uint64_t)s->perimeter * s->perimeter));
+        if (circularity100 < 24) {
+            continue;
+        }
+
+        uint32_t bbox_area = (uint32_t)bbox_w * bbox_h;
+        uint32_t fill100 = (s->count * 100U) / bbox_area;
+        uint32_t score = s->count * 3U + circularity100 * 3U + fill100;
+
+        float cx = (float)s->sum_x / (float)s->count;
+        float cy = (float)s->sum_y / (float)s->count;
+        if (!blue_marker_candidate_in_safe_area(s, cx, cy, img_w, img_h)) {
+            continue;
+        }
+
+        blue_marker_t candidate = {
+            .found = true,
+            .x = cx,
+            .y = cy,
+            .min_x = s->min_x,
+            .max_x = s->max_x,
+            .min_y = s->min_y,
+            .max_y = s->max_y,
+            .area = s->count,
+            .score = score,
+        };
+
+        for (uint8_t slot = 0; slot < 12; slot++) {
+            if (!candidates[slot].found || candidate.score > candidates[slot].score) {
+                for (int8_t j = 11; j > (int8_t)slot; j--) {
+                    candidates[j] = candidates[j - 1];
+                }
+                candidates[slot] = candidate;
+                if (candidate_count < 12) {
+                    candidate_count++;
+                }
+                break;
+            }
+        }
+    }
+
+    bool ok = select_blue_marker_board(candidates, candidate_count, img_w, img_h, board);
+    if (ok) {
+        update_board_bbox_from_corners(board, img_w, img_h);
+    }
+
+    free(labels);
+    free(parent);
+    free(stats);
+    return ok;
 }
 
 static bool solve_image_to_unit_homography(const board_info_t *board, float h[9])
@@ -1508,16 +2160,13 @@ bool fruit_detect_board_relative_coord(const board_info_t *board,
 
     float u = (h[0] * x + h[1] * y + h[2]) / denom;
     float v = (h[3] * x + h[4] * y + h[5]) / denom;
-    float width = (distance_f(board->tl_x, board->tl_y, board->tr_x, board->tr_y) +
-                   distance_f(board->bl_x, board->bl_y, board->br_x, board->br_y)) * 0.5f;
-    float height = (distance_f(board->tl_x, board->tl_y, board->bl_x, board->bl_y) +
-                    distance_f(board->tr_x, board->tr_y, board->br_x, board->br_y)) * 0.5f;
-
-    *relative_x = u * width;
-    *relative_y = v * height;
+    *relative_x = u * 100.0f;
+    *relative_y = v * 100.0f;
     return true;
 }
 
+#if 0
+/* Black-line reference detection is disabled; blue dots are the only board reference. */
 static void detect_board_from_mask(uint8_t *mask,
                                    uint16_t img_w,
                                    uint16_t img_h,
@@ -1723,6 +2372,7 @@ static void detect_board_from_mask(uint8_t *mask,
             board->bl_x = left_bottom_x;
             board->bl_y = (float)left_bottom_y;
             board->area_px = left_score + right_score;
+            board->reference_mode = BOARD_REFERENCE_NONE;
             float ix;
             float iy;
             if (left_vertical_ok && top_horizontal_ok &&
@@ -1874,6 +2524,7 @@ static void detect_board_from_mask(uint8_t *mask,
             board->bl_x = (float)min_x;
             board->bl_y = (float)max_y;
             board->area_px = left->count + right->count;
+            board->reference_mode = BOARD_REFERENCE_NONE;
             update_board_bbox_from_corners(board, img_w, img_h);
         }
     }
@@ -1882,6 +2533,7 @@ static void detect_board_from_mask(uint8_t *mask,
     free(parent);
     free(stats);
 }
+#endif
 
 static void stats_init(component_stats_t *s, uint16_t img_w, uint16_t img_h)
 {
@@ -2173,14 +2825,12 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
     }
 
     uint8_t *mask = detect_malloc(total_pixels);
-    uint8_t *board_mask = detect_malloc(total_pixels);
-    uint8_t *gray = detect_malloc(total_pixels);
-    if (!mask || !board_mask || !gray) {
+    uint8_t *blue_mask = detect_malloc(total_pixels);
+    if (!mask || !blue_mask) {
         ESP_LOGE(TAG, "No memory for mask, need %u bytes", (unsigned int)total_pixels);
         free(rgb);
         free(mask);
-        free(board_mask);
-        free(gray);
+        free(blue_mask);
         return ESP_ERR_NO_MEM;
     }
 
@@ -2189,41 +2839,26 @@ esp_err_t fruit_detect_process(camera_fb_t *fb, fruit_detect_result_t *result)
         uint8_t g = rgb[i * 3 + 1];
         uint8_t b = rgb[i * 3 + 2];
         bool citrus = is_citrus_pixel(r, g, b);
+        bool blue_reference = is_blue_reference_pixel(r, g, b);
         mask[i] = citrus ? 1 : 0;
-        gray[i] = rgb_luma(r, g, b);
-        board_mask[i] = (!citrus && is_black_reference_pixel(r, g, b)) ? 1 : 0;
-    }
-
-    for (uint16_t y = 4; y + 4 < img_h; y++) {
-        for (uint16_t x = 4; x + 4 < img_w; x++) {
-            size_t idx = (size_t)y * img_w + x;
-            uint8_t center = gray[idx];
-            uint8_t left = gray[(size_t)y * img_w + x - 4];
-            uint8_t right = gray[(size_t)y * img_w + x + 4];
-            uint8_t up = gray[(size_t)(y - 4) * img_w + x];
-            uint8_t down = gray[(size_t)(y + 4) * img_w + x];
-            uint8_t horizontal_bg = (uint8_t)(((int)left + (int)right) / 2);
-            uint8_t vertical_bg = (uint8_t)(((int)up + (int)down) / 2);
-            bool vertical_line = horizontal_bg > center + 7;
-            bool horizontal_line = vertical_bg > center + 7;
-            if ((vertical_line || horizontal_line) && center < 190 && !mask[idx]) {
-                board_mask[idx] = 1;
-            }
-        }
+        blue_mask[i] = blue_reference ? 1 : 0;
     }
 
     free(rgb);
-    free(gray);
 
     uint8_t *scratch = detect_malloc(total_pixels);
     if (!scratch) {
         ESP_LOGE(TAG, "No memory for mask scratch, need %u bytes", (unsigned int)total_pixels);
         free(mask);
-        free(board_mask);
+        free(blue_mask);
         return ESP_ERR_NO_MEM;
     }
-    detect_board_from_mask(board_mask, img_w, img_h, &result->board);
-    free(board_mask);
+
+    close_mask_3x3(blue_mask, scratch, img_w, img_h);
+    detect_board_from_blue_markers(blue_mask, img_w, img_h, &result->board);
+    /* Black-line board detection is intentionally disabled; blue dots are the only reference. */
+    /* detect_board_from_mask(board_mask, img_w, img_h, &result->board); */
+    free(blue_mask);
 
     open_mask_3x3(mask, scratch, img_w, img_h);
     free(scratch);

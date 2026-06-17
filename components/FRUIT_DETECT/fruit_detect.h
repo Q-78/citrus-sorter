@@ -18,6 +18,11 @@ typedef enum {
     FRUIT_GRADE_LARGE = 1,
 } fruit_grade_t;
 
+typedef enum {
+    BOARD_REFERENCE_NONE = 0,
+    BOARD_REFERENCE_BLUE_DOTS = 1,
+} board_reference_mode_t;
+
 typedef struct {
     uint16_t center_x;
     uint16_t center_y;
@@ -32,6 +37,7 @@ typedef struct {
 
 typedef struct {
     bool found;
+    board_reference_mode_t reference_mode;
     uint16_t center_x;
     uint16_t center_y;
     uint16_t bbox_x;

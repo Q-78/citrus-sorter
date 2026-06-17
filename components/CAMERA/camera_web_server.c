@@ -81,12 +81,20 @@ static esp_err_t send_base64_data(httpd_req_t *req, const uint8_t *data, size_t 
 
 static esp_err_t send_detection_json(httpd_req_t *req,
                                      const fruit_detect_result_t *result,
-                                     const m0_uart_payload_t *payload)
+                                     const m0_uart_payload_t *payload,
+                                     bool detect_ok,
+                                     const camera_fb_t *image_fb)
 {
-    char buf[512];
+    const char *reference_mode = "none";
+    if (result->board.reference_mode == BOARD_REFERENCE_BLUE_DOTS) {
+        reference_mode = "blue_dots";
+    }
+
+    char buf[768];
     int len = snprintf(buf, sizeof(buf),
-                       "{\"image_width\":%u,\"image_height\":%u,\"count\":%u,"
+                       "{\"detect_ok\":%s,\"image_width\":%u,\"image_height\":%u,\"count\":%u,"
                        "\"board\":{\"found\":%s,\"center_x\":%u,\"center_y\":%u,"
+                       "\"reference_mode\":\"%s\","
                        "\"bbox_x\":%u,\"bbox_y\":%u,\"bbox_w\":%u,\"bbox_h\":%u,"
                        "\"tl_x\":%.2f,\"tl_y\":%.2f,\"tr_x\":%.2f,\"tr_y\":%.2f,"
                        "\"br_x\":%.2f,\"br_y\":%.2f,\"bl_x\":%.2f,\"bl_y\":%.2f,"
@@ -94,9 +102,11 @@ static esp_err_t send_detection_json(httpd_req_t *req,
                        "\"uart\":{\"header\":\"0xAA\",\"has_fruit\":%u,\"grade\":%u,"
                        "\"x\":%.2f,\"y\":%.2f,\"relative_valid\":%s},"
                        "\"fruits\":[",
+                       detect_ok ? "true" : "false",
                        result->image_width, result->image_height, result->count,
                        result->board.found ? "true" : "false",
                        result->board.center_x, result->board.center_y,
+                       reference_mode,
                        result->board.bbox_x, result->board.bbox_y,
                        result->board.bbox_w, result->board.bbox_h,
                        result->board.tl_x, result->board.tl_y,
@@ -145,7 +155,19 @@ static esp_err_t send_detection_json(httpd_req_t *req,
         }
     }
 
-    return send_text_chunk(req, "]}");
+    if (!image_fb) {
+        return send_text_chunk(req, "]}");
+    }
+
+    err = send_text_chunk(req, "],\"image\":\"data:image/jpeg;base64,");
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = send_base64_data(req, image_fb->buf, image_fb->len);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return send_text_chunk(req, "\"}");
 }
 
 static esp_err_t index_handler(httpd_req_t *req)
@@ -214,21 +236,15 @@ static esp_err_t index_handler(httpd_req_t *req)
         "<div class='card'><div class='label'>Detection</div><div class='value' id='status'>--</div></div>"
         "<div class='card'><div class='label'>Reference</div><div class='value' id='boardstatus'>--</div></div>"
         "<div class='card'><div class='label'>M0 Frame</div><div class='value' id='m0frame'>--</div></div></div>"
-        "<div class='card'><div class='label'>Reference Relative Coordinates</div><div id='m0coords' style='font-size:14px;margin-top:6px;line-height:1.7'></div></div>"
-        "<div id='table'></div><script>const detectOk=";
+        "<div class='card'><div class='label'>Reference Coordinates</div><div id='m0coords' style='font-size:14px;margin-top:6px;line-height:1.7'></div></div>"
+        "<div id='table'></div><script>let data=";
 
     res = send_text_chunk(req, page_start);
     if (res == ESP_OK) {
-        res = send_text_chunk(req, det_ret == ESP_OK ? "true" : "false");
+        res = send_detection_json(req, &result, &uart_payload, det_ret == ESP_OK, NULL);
     }
     if (res == ESP_OK) {
-        res = send_text_chunk(req, ";const data=");
-    }
-    if (res == ESP_OK) {
-        res = send_detection_json(req, &result, &uart_payload);
-    }
-    if (res == ESP_OK) {
-        res = send_text_chunk(req, ";const imageSrc='data:image/jpeg;base64,");
+        res = send_text_chunk(req, ";let detectOk=!!data.detect_ok;let imageSrc='data:image/jpeg;base64,");
     }
     if (res == ESP_OK) {
         res = send_base64_data(req, fb->buf, fb->len);
@@ -245,13 +261,14 @@ static esp_err_t index_handler(httpd_req_t *req)
     }
 
     const char *page_end =
-        "';const cv=document.getElementById('view');const ctx=cv.getContext('2d');"
-        "const img=new Image();img.onload=function(){cv.width=img.naturalWidth;cv.height=img.naturalHeight;"
-        "ctx.drawImage(img,0,0);drawOverlay();fillInfo();};img.src=imageSrc;"
+        "';const cv=document.getElementById('view');const ctx=cv.getContext('2d');let refreshBusy=false;"
+        "function loadImage(){const img=new Image();img.onload=function(){cv.width=img.naturalWidth;cv.height=img.naturalHeight;"
+        "ctx.drawImage(img,0,0);drawOverlay();fillInfo();};img.src=imageSrc;}loadImage();"
         "function gradeClass(g){return g===1?'large':'small'}"
-        "function drawOverlay(){const b=data.board;if(b.found){ctx.strokeStyle='#c9894b';ctx.lineWidth=3;ctx.beginPath();"
+        "function drawOverlay(){const b=data.board;if(b.found){const refLabel='blue dots reference';ctx.strokeStyle='#c9894b';ctx.lineWidth=3;ctx.beginPath();"
         "ctx.moveTo(b.tl_x,b.tl_y);ctx.lineTo(b.tr_x,b.tr_y);ctx.lineTo(b.br_x,b.br_y);ctx.lineTo(b.bl_x,b.bl_y);ctx.closePath();ctx.stroke();"
-        "ctx.font='bold 12px Arial';ctx.fillStyle='#c9894b';ctx.fillText('reference',b.tl_x+4,Math.max(12,b.tl_y-6));}"
+        "ctx.font='bold 12px Arial';ctx.fillStyle='#c9894b';ctx.fillText(refLabel,b.tl_x+4,Math.max(12,b.tl_y-6));"
+        "ctx.fillStyle='#00a8ff';for(const p of [[b.tl_x,b.tl_y],[b.tr_x,b.tr_y],[b.br_x,b.br_y],[b.bl_x,b.bl_y]]){ctx.beginPath();ctx.arc(p[0],p[1],5,0,Math.PI*2);ctx.fill();}}"
         "for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];"
         "const cls=gradeClass(f.size_grade);const color=cls==='large'?'#ff6b6b':'#7bdff2';"
         "ctx.strokeStyle=color;ctx.lineWidth=2;ctx.strokeRect(f.bbox_x,f.bbox_y,f.bbox_w,f.bbox_h);"
@@ -264,18 +281,25 @@ static esp_err_t index_handler(httpd_req_t *req)
         "function fillInfo(){document.getElementById('count').textContent=data.count;"
         "document.getElementById('size').textContent=data.image_width+' x '+data.image_height;"
         "const s=document.getElementById('status');s.textContent=detectOk?'OK':'Decode Error';s.className='value '+(detectOk?'ok':'warn');"
-        "const b=data.board;document.getElementById('boardstatus').textContent=b.found?(b.bbox_w+' x '+b.bbox_h):'--';"
+        "const b=data.board;document.getElementById('boardstatus').textContent=b.found?(b.reference_mode+' '+b.bbox_w+' x '+b.bbox_h):'--';"
         "const u=data.uart;document.getElementById('m0frame').textContent=u.header+' '+u.has_fruit+' '+u.grade+' '+u.x.toFixed(2)+' '+u.y.toFixed(2);"
         "document.getElementById('m0coords').innerHTML='has_fruit: '+u.has_fruit+' &nbsp; grade: '+u.grade+'<br>'"
-        "+'sent x: '+u.x.toFixed(2)+' &nbsp; sent y: '+u.y.toFixed(2)+'<br>'"
-        "+'reference: '+(b.found?('TL '+b.tl_x.toFixed(1)+','+b.tl_y.toFixed(1)+' TR '+b.tr_x.toFixed(1)+','+b.tr_y.toFixed(1)+'<br>BL '+b.bl_x.toFixed(1)+','+b.bl_y.toFixed(1)+' BR '+b.br_x.toFixed(1)+','+b.br_y.toFixed(1)):'--');"
+        "+'sent x%: '+u.x.toFixed(2)+' &nbsp; sent y%: '+u.y.toFixed(2)+'<br>'"
+        "+'mode: '+(b.found?b.reference_mode:'--')+'<br>'"
+        "+'coordinate frame: TL=(0,0), TR=(100,0), BR=(100,100), BL=(0,100)<br>'"
+        "+'image points: '+(b.found?('TL '+b.tl_x.toFixed(1)+','+b.tl_y.toFixed(1)+' TR '+b.tr_x.toFixed(1)+','+b.tr_y.toFixed(1)+'<br>BL '+b.bl_x.toFixed(1)+','+b.bl_y.toFixed(1)+' BR '+b.br_x.toFixed(1)+','+b.br_y.toFixed(1)):'--');"
         "let html='';if(data.fruits.length===0){html='<div class=\"empty\">No citrus-colored fruit region found.</div>';}else{"
-        "html='<table><thead><tr><th>#</th><th>Pixel Center</th><th>Bounds</th><th>Reference Relative</th><th>Diameter</th><th>Area</th><th>Box</th><th>Grade</th></tr></thead><tbody>';"
+        "html='<table><thead><tr><th>#</th><th>Pixel Center</th><th>Bounds</th><th>Reference Position (%)</th><th>Diameter</th><th>Area</th><th>Box</th><th>Grade</th></tr></thead><tbody>';"
         "for(let i=0;i<data.fruits.length;i++){const f=data.fruits[i];const cls=gradeClass(f.size_grade);"
         "const rel=f.relative_valid?(f.relative_x.toFixed(2)+', '+f.relative_y.toFixed(2)):'--';"
         "const bounds='x '+f.x_min+'..'+f.x_max+'<br>y '+f.y_min+'..'+f.y_max;"
         "html+='<tr><td>'+(i+1)+'</td><td>'+f.center_x+', '+f.center_y+'</td><td>'+bounds+'</td><td>'+rel+'</td><td>'+f.diameter_px+' px</td><td>'+f.area_px+' px</td><td>'+f.bbox_w+' x '+f.bbox_h+'</td><td class=\"'+cls+'\">'+f.grade_label+'</td></tr>';}"
         "html+='</tbody></table>';}document.getElementById('table').innerHTML=html;}"
+        "async function refreshSnapshot(){if(refreshBusy)return;refreshBusy=true;try{"
+        "const r=await fetch('/snapshot?t='+Date.now(),{cache:'no-store'});if(!r.ok)throw new Error('snapshot');"
+        "const next=await r.json();data=next;detectOk=!!next.detect_ok;if(next.image){imageSrc=next.image;loadImage();}else{fillInfo();}"
+        "}catch(e){const s=document.getElementById('status');s.textContent='Refresh Error';s.className='value warn';}"
+        "finally{refreshBusy=false;}}"
         "const autoRefresh=";
 
     if (res == ESP_OK) {
@@ -286,7 +310,7 @@ static esp_err_t index_handler(httpd_req_t *req)
     }
 
     const char *page_finish =
-        ";if(autoRefresh){setTimeout(function(){location.href='/?auto=1';},1000);}"
+        ";if(autoRefresh){setInterval(refreshSnapshot,1200);}"
         "</script></div></body></html>";
 
     if (res == ESP_OK) {
@@ -295,6 +319,50 @@ static esp_err_t index_handler(httpd_req_t *req)
 
     camera_return(fb);
 
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    return res;
+}
+
+static esp_err_t snapshot_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = camera_capture();
+    if (!fb) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    if (fb->format != PIXFORMAT_JPEG) {
+        ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
+        camera_return(fb);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    fruit_detect_result_t result;
+    esp_err_t det_ret = fruit_detect_process(fb, &result);
+    m0_uart_payload_t uart_payload = {0};
+    if (det_ret != ESP_OK) {
+        memset(&result, 0, sizeof(result));
+        result.image_width = fb->width;
+        result.image_height = fb->height;
+        ESP_LOGW(TAG, "Fruit detection failed: 0x%x", det_ret);
+    } else {
+        m0_uart_build_payload(&result, &uart_payload);
+        esp_err_t uart_ret = m0_uart_send_result(&result);
+        if (uart_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
+        }
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    esp_err_t res = send_detection_json(req, &result, &uart_payload, det_ret == ESP_OK, fb);
+    camera_return(fb);
     if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, NULL, 0);
     }
@@ -402,6 +470,13 @@ void start_camera_web_server(void)
         .user_ctx = NULL,
     };
 
+    httpd_uri_t snapshot_uri = {
+        .uri = "/snapshot",
+        .method = HTTP_GET,
+        .handler = snapshot_handler,
+        .user_ctx = NULL,
+    };
+
     httpd_uri_t stream_uri = {
         .uri = "/stream",
         .method = HTTP_GET,
@@ -411,6 +486,7 @@ void start_camera_web_server(void)
 
     httpd_register_uri_handler(server, &index_uri);
     httpd_register_uri_handler(server, &capture_uri);
+    httpd_register_uri_handler(server, &snapshot_uri);
     httpd_register_uri_handler(server, &stream_uri);
 
     ESP_LOGI(TAG, "Camera web server started. Open http://192.168.4.1/ after connecting to ESP32S3_OV5640_AP");
