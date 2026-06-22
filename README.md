@@ -1,32 +1,235 @@
-# _Sample project_
+# Citrus Sorter（ESP32-S3 柑橘视觉分拣）
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+基于 ESP32-S3、OV5640/OV2640 摄像头和 ESP-IDF 的嵌入式柑橘识别与分拣前端。设备会自行建立 Wi-Fi 热点，周期性采集 JPEG 图像，在板端完成参考板定位、柑橘区域检测、尺寸分级和参考板相对坐标计算，并将第一颗柑橘的结果通过 UART 发送给下位 M0 控制器。同时提供浏览器调试页、JSON 快照、JPEG 抓拍和 MJPEG 视频流。
 
-This is the simplest buildable example. The example is used by command `idf.py create-project`
-that copies the project to user specified path and set it's name. For more information follow the [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project)
+## 主要功能
 
+- ESP32-S3 SoftAP，无需外部路由器即可访问调试页面。
+- OV5640/OV2640 摄像头采集，默认 VGA（640 × 480）JPEG。
+- 基于 RGB 颜色阈值、形态学处理和连通域分析的板端柑橘检测，最多输出 10 个目标。
+- 使用四个蓝色角点识别透视参考板，并把目标位置映射到 0～100% 的板面坐标。
+- 依据柑橘直径与参考板短边的比例进行大/小果分级。
+- 后台任务每 3 秒自主检测；对不稳定参考板最多连续尝试 3 帧。
+- UART1 以固定 11 字节二进制帧向 M0 输出首个目标。
+- Web 页面叠加参考板、目标框、中心、直径、等级与 UART 数据。
 
+## 系统工作流程
 
-## How to use example
-We encourage the users to use the example as a template for the new projects.
-A recommended way is to follow the instructions on a [docs page](https://docs.espressif.com/projects/esp-idf/en/latest/api-guides/build-system.html#start-a-new-project).
-
-## Example folder contents
-
-The project **sample_project** contains one source file in C language [main.c](main/main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt`
-files that provide set of directives and instructions describing the project's source files and targets
-(executable, library, or both). 
-
-Below is short explanation of remaining files in the project folder.
-
+```text
+上电
+ ├─ 初始化 NVS 与 Wi-Fi SoftAP
+ ├─ 初始化摄像头、柑橘检测器和 UART1
+ ├─ 启动自主检测任务（每 3 秒）
+ │   ├─ 采集 JPEG
+ │   ├─ 解码为 RGB888
+ │   ├─ 定位四个蓝色参考点并校验参考板几何形状
+ │   ├─ 提取柑橘色区域、分割连通域并筛选目标
+ │   ├─ 计算参考板相对坐标与大/小果等级
+ │   ├─ 通过 UART 向 M0 发送第一颗柑橘
+ │   └─ 缓存本次 JPEG 与检测结果
+ └─ 启动 HTTP 服务，向浏览器提供缓存结果
 ```
-├── CMakeLists.txt
-├── main
-│   ├── CMakeLists.txt
-│   └── main.c
-└── README.md                  This is the file you are currently reading
+
+摄像头访问由互斥锁保护；自主检测任务、网页抓拍和视频流共享同一份最新检测缓存，避免多个任务同时占用摄像头帧缓冲。
+
+## 硬件与接线
+
+### 运行平台
+
+- 主控：ESP32-S3（工程引脚依据 Freenove ESP32-S3 WROOM 板卡标注）
+- 摄像头：OV5640 或兼容的 OV2640 DVP 模组
+- 下位控制器：带 UART RX 的 M0 控制器
+- Flash：配置为 16 MB
+- PSRAM：Octal、80 MHz；摄像头帧缓冲和大块图像内存优先放入 PSRAM
+- CPU：240 MHz
+
+### 摄像头引脚
+
+| 摄像头信号 | ESP32-S3 GPIO | 说明 |
+| --- | ---: | --- |
+| XCLK | 15 | 工程输出 10 MHz 时钟 |
+| SIOD / SDA | 4 | SCCB 数据 |
+| SIOC / SCL | 5 | SCCB 时钟 |
+| D0 / Y2 | 11 | 并行图像数据 |
+| D1 / Y3 | 9 | 并行图像数据 |
+| D2 / Y4 | 8 | 并行图像数据 |
+| D3 / Y5 | 10 | 并行图像数据 |
+| D4 / Y6 | 12 | 并行图像数据 |
+| D5 / Y7 | 18 | 并行图像数据 |
+| D6 / Y8 | 17 | 并行图像数据 |
+| D7 / Y9 | 16 | 并行图像数据 |
+| VSYNC | 6 | 场同步 |
+| HREF | 7 | 行有效 |
+| PCLK | 13 | 像素时钟 |
+| PWDN | 未连接 | 配置为 `GPIO_NUM_NC` |
+| RESET | 未连接 | 配置为 `GPIO_NUM_NC` |
+
+### M0 UART 接线
+
+| ESP32-S3 | M0 | 说明 |
+| --- | --- | --- |
+| GPIO41（UART1 TX） | UART RX | 115200 baud，8N1 |
+| GND | GND | 两块板必须共地 |
+
+当前固件只配置 TX，不接收 M0 数据。`GPIO42` 仅在源码所述的 UART 回环调试模式中作为可选 RX。
+
+### 参考板布置
+
+在工作区域四角放置清晰的蓝色圆点，分别代表参考板的左上、右上、右下和左下角。固件将这个四边形透视映射为：
+
+```text
+TL (0, 0) -------- TR (100, 0)
+   |                    |
+   |                    |
+BL (0, 100) ------ BR (100, 100)
 ```
-Additionally, the sample project contains Makefile and component.mk files, used for the legacy Make based build system. 
-They are not used or needed when building with CMake and idf.py.
+
+UART 和网页中的 `x`、`y` 是参考板内的百分比坐标，不是毫米或固定世界坐标。只有识别到参考板且四角几何校验通过时，检测结果才会被视为稳定并发送给 M0。蓝点应避开画面边缘、保持高饱和度，并让整个参考区域尽量占据画面的主要部分。
+
+## 识别与分级原理
+
+1. 将摄像头 JPEG 解码为 RGB888。
+2. 分别建立柑橘颜色掩膜和蓝色参考点掩膜。
+3. 对蓝点掩膜执行 3 × 3 闭运算，筛选候选点并组合成凸四边形。
+4. 校验四角角度、边长比例、宽高比和参考板面积；参考板角度允许范围为 65°～115°。
+5. 对柑橘掩膜执行 3 × 3 开运算，再用并查集完成连通域标记。
+6. 按面积、边界框比例、填充率和圆度过滤噪声；对明显拉长且中间存在投影谷值的区域尝试拆分粘连果。
+7. 按面积从大到小排序，最多保留 10 个目标。
+8. 由四个参考点求单应性矩阵，将像素中心转换为参考板百分比坐标。
+9. 当 `柑橘直径 / 参考板平均短边 >= 0.407` 时判为大果，否则判为小果。
+
+识别算法为固定阈值的传统图像处理，效果会受到光照、背景颜色、蓝点颜色、相机白平衡和果皮成熟度影响。部署到新的机械结构或照明环境时，应优先调整 `components/FRUIT_DETECT/fruit_detect.c` 中的颜色与几何阈值。
+
+## Wi-Fi 与 Web 调试
+
+设备启动后会创建以下热点：
+
+| 参数 | 默认值 |
+| --- | --- |
+| SSID | `ESP32S3_OV5640_AP` |
+| 密码 | `12345678` |
+| 信道 | 1 |
+| 最大连接数 | 2 |
+| 设备地址 | `http://192.168.4.1/` |
+
+连接热点后可访问：
+
+| 路径 | 返回内容 | 用途 |
+| --- | --- | --- |
+| `/` | HTML | 最新检测结果、图像叠加和 UART 数据 |
+| `/?auto=1` | HTML | 每 3 秒自动获取最新快照 |
+| `/snapshot` | JSON | 检测结果和 Base64 JPEG，允许跨域访问 |
+| `/capture` | `image/jpeg` | 最新缓存的原始 JPEG |
+| `/stream` | MJPEG | 随自主检测缓存更新的视频流 |
+
+`/snapshot` 的主要字段包括 `detect_ok`、图像尺寸、目标数量、参考板四角、UART 预览、每颗柑橘的中心/边界框/直径/面积/相对坐标/等级，以及 `data:image/jpeg;base64,...` 格式的图像。这里的“视频流”更新速度受 3 秒自主检测周期限制，并非摄像头满帧率直播。
+
+## UART 协议
+
+每次产生稳定检测结果时，固件发送一个 11 字节帧。多目标情况下只发送按面积排序后的第一颗（通常为最大目标）。
+
+| 偏移 | 长度 | 字段 | 格式 |
+| ---: | ---: | --- | --- |
+| 0 | 1 | 帧头 | 固定 `0xAA` |
+| 1 | 1 | `has_fruit` | `0` 无有效目标，`1` 有目标 |
+| 2 | 1 | `grade` | `0` 小果，`1` 大果 |
+| 3 | 4 | `x` | IEEE 754 `float32`，小端序，参考板 X 百分比 |
+| 7 | 4 | `y` | IEEE 754 `float32`，小端序，参考板 Y 百分比 |
+
+当前自主任务只在参考板稳定且检测流程成功时发送 UART 帧；没有稳定参考板时会跳过本轮 M0 输出，而不是发送全零帧。
+
+## 开发环境与依赖
+
+- ESP-IDF：5.1.2（`dependencies.lock` 锁定版本）
+- 构建系统：CMake + `idf.py`
+- 目标芯片：`esp32s3`
+- `espressif/esp32-camera`：2.1.6
+- `espressif/esp_jpeg`：1.3.1（由摄像头组件传递并锁定）
+
+仓库包含 `managed_components/` 下的依赖源码。正常情况下应由 ESP-IDF Component Manager 根据 `main/idf_component.yml` 和 `dependencies.lock` 管理，不要直接修改这些第三方文件。
+
+## 构建、烧录与运行
+
+先进入已配置 ESP-IDF 5.1.2 环境，再在项目根目录执行：
+
+```bash
+idf.py set-target esp32s3
+idf.py build
+idf.py -p COMx flash monitor
+```
+
+将 `COMx` 替换为开发板实际串口。若目标芯片和现有配置未改变，通常无需重复执行 `idf.py set-target`。
+
+启动日志应依次出现 Wi-Fi AP、摄像头、UART、自主检测任务和 Web 服务器初始化信息。随后：
+
+1. 用电脑或手机连接 `ESP32S3_OV5640_AP`。
+2. 输入密码 `12345678`。
+3. 浏览器打开 `http://192.168.4.1/`。
+4. 检查蓝色四点参考板轮廓、柑橘框、分级和 UART 坐标是否合理。
+
+## 工程目录
+
+```text
+citrus-sorter/
+├─ CMakeLists.txt                 # ESP-IDF 顶层工程，当前项目名为 1_LED
+├─ dependencies.lock             # IDF、摄像头与 JPEG 组件的锁定版本
+├─ sdkconfig                     # 本地构建配置（已被 .gitignore 忽略）
+├─ main/
+│  ├─ main.c                     # NVS、SoftAP、各模块和后台任务的启动入口
+│  ├─ CMakeLists.txt             # main 组件构建清单
+│  └─ idf_component.yml          # esp32-camera 组件依赖声明
+├─ components/
+│  ├─ CMakeLists.txt             # 自定义组件注册及 ESP-IDF 依赖
+│  ├─ CAMERA/
+│  │  ├─ camera.c/.h             # 摄像头引脚、参数、互斥采集与帧归还
+│  │  └─ camera_web_server.c/.h  # 检测任务、缓存、Web 页面与 HTTP 接口
+│  ├─ FRUIT_DETECT/
+│  │  └─ fruit_detect.c/.h       # 参考板、柑橘检测、分级和相对坐标算法
+│  ├─ M0_UART/
+│  │  └─ m0_uart.c/.h            # UART1 初始化、数据组帧与发送
+│  ├─ CALIBRATION/
+│  │  └─ calibration.c/.h        # 六点标定得到的像素→世界坐标工具
+│  └─ LED/
+│     └─ led.c/.h                # GPIO38 LED 初始化工具
+├─ managed_components/
+│  ├─ espressif__esp32-camera/   # Espressif 摄像头驱动（第三方托管组件）
+│  └─ espressif__esp_jpeg/       # Espressif JPEG 解码器（第三方托管组件）
+└─ MODIFICATION_NOTES.md         # 早期摄像头预览修改记录
+```
+
+`CALIBRATION` 提供一组基于六个固定点拟合的像素到世界坐标单应性函数，但当前主检测/UART 流程使用的是蓝色四点参考板的 0～100% 相对坐标，没有调用该固定标定函数。`LED` 组件可初始化 GPIO38，但当前 `app_main()` 未调用 `led_init()`。这两个模块保留为后续机械坐标标定和状态指示扩展使用。
+
+## 常见问题
+
+### 摄像头初始化失败
+
+- 核对摄像头型号、排线方向和上述 GPIO 映射。
+- 确认板卡具有可用 PSRAM，并与 `sdkconfig` 的 Octal PSRAM 配置一致。
+- 当前 XCLK 为 10 MHz；更换摄像头模组后可能需要重新验证时钟。
+
+### 页面显示 `No Stable Frame`
+
+- 确认四个蓝点都在画面内，且没有紧贴边缘。
+- 改善光照与蓝点/背景的颜色对比。
+- 检查参考板是否过小、过度倾斜或严重变形。
+- 自主任务会重试 3 帧；仍不稳定时不会向 M0 输出旧坐标。
+
+### 柑橘漏检或误检
+
+- 使用均匀、稳定的照明，避免与柑橘颜色接近的背景。
+- 在目标部署环境重新标定颜色阈值、最小面积和圆度限制。
+- 若果实粘连，尽量让果实之间保留可见间隙；算法仅能拆分具有明显投影谷值的连通区域。
+
+### UART 没有数据
+
+- 确认 GPIO41 到 M0 RX 的接线和共地。
+- 确认 M0 使用 115200、8 数据位、无校验、1 停止位。
+- UART 只在检测稳定时发送；先通过 Web 页面确认 `detect_ok`、参考板和目标结果。
+
+## 当前实现边界
+
+- Wi-Fi SSID 与密码直接写在 `main/main.c` 中，面向封闭调试网络；产品化前应改为可配置并使用独立凭据。
+- 图像识别依赖固定颜色/形状阈值，不是神经网络模型。
+- 大小果分级是相对于参考板的比例判定，不代表真实直径单位。
+- M0 协议没有长度、校验和、序号或应答机制；复杂电磁环境下建议后续增强帧可靠性。
+- 工程当前采用 single-app 分区，没有 OTA 分区。
