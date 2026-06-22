@@ -76,6 +76,11 @@ void app_main(void)
 
     fruit_detect_init();
     m0_uart_init();
+    ret = start_camera_detection_task();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Autonomous detection task failed to start: 0x%x", ret);
+        return;
+    }
     start_camera_web_server();
 
     while (true) {
