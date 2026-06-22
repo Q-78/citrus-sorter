@@ -17,6 +17,7 @@
 static const char *TAG = "camera_web";
 
 #define PART_BOUNDARY "123456789000000000000987654321"
+#define DETECTION_MAX_CAPTURE_ATTEMPTS 3
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
@@ -170,41 +171,109 @@ static esp_err_t send_detection_json(httpd_req_t *req,
     return send_text_chunk(req, "\"}");
 }
 
+static bool detection_result_ready_for_output(const fruit_detect_result_t *result)
+{
+    return result &&
+           result->board.found &&
+           fruit_detect_board_geometry_valid(&result->board);
+}
+
+static void clear_detection_for_output(fruit_detect_result_t *result,
+                                       const camera_fb_t *fb)
+{
+    if (!result) {
+        return;
+    }
+
+    uint16_t width = fb ? fb->width : result->image_width;
+    uint16_t height = fb ? fb->height : result->image_height;
+    memset(result, 0, sizeof(*result));
+    result->image_width = width;
+    result->image_height = height;
+}
+
+static esp_err_t capture_stable_detection(camera_fb_t **out_fb,
+                                          fruit_detect_result_t *result,
+                                          bool *detect_ok)
+{
+    if (!out_fb || !result || !detect_ok) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_fb = NULL;
+    *detect_ok = false;
+    memset(result, 0, sizeof(*result));
+
+    for (uint8_t attempt = 0; attempt < DETECTION_MAX_CAPTURE_ATTEMPTS; attempt++) {
+        camera_fb_t *fb = camera_capture();
+        if (!fb) {
+            return ESP_FAIL;
+        }
+
+        if (fb->format != PIXFORMAT_JPEG) {
+            ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
+            camera_return(fb);
+            return ESP_FAIL;
+        }
+
+        fruit_detect_result_t candidate;
+        esp_err_t ret = fruit_detect_process(fb, &candidate);
+        if (ret == ESP_OK && detection_result_ready_for_output(&candidate)) {
+            *out_fb = fb;
+            *result = candidate;
+            *detect_ok = true;
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "Rejected unstable detection frame %u/%u: ret=0x%x board=%u",
+                 (unsigned int)(attempt + 1),
+                 (unsigned int)DETECTION_MAX_CAPTURE_ATTEMPTS,
+                 ret,
+                 ret == ESP_OK && candidate.board.found ? 1U : 0U);
+
+        if (attempt + 1 == DETECTION_MAX_CAPTURE_ATTEMPTS) {
+            *out_fb = fb;
+            if (ret == ESP_OK) {
+                *result = candidate;
+                clear_detection_for_output(result, fb);
+            } else {
+                clear_detection_for_output(result, fb);
+            }
+            *detect_ok = false;
+            return ESP_OK;
+        }
+
+        camera_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    return ESP_FAIL;
+}
+
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
 
-    camera_fb_t *fb = camera_capture();
-    if (!fb) {
+    camera_fb_t *fb = NULL;
+    fruit_detect_result_t result;
+    bool detect_ok = false;
+    esp_err_t capture_ret = capture_stable_detection(&fb, &result, &detect_ok);
+    if (capture_ret != ESP_OK || !fb) {
         return httpd_resp_send(req,
                                "<!DOCTYPE html><html><body><h2>Capture failed</h2>"
                                "<p>Camera did not return a frame.</p></body></html>",
                                HTTPD_RESP_USE_STRLEN);
     }
 
-    if (fb->format != PIXFORMAT_JPEG) {
-        ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
-        camera_return(fb);
-        return httpd_resp_send(req,
-                               "<!DOCTYPE html><html><body><h2>Capture failed</h2>"
-                               "<p>Captured frame is not JPEG.</p></body></html>",
-                               HTTPD_RESP_USE_STRLEN);
-    }
-
-    fruit_detect_result_t result;
-    esp_err_t det_ret = fruit_detect_process(fb, &result);
     m0_uart_payload_t uart_payload = {0};
-    if (det_ret != ESP_OK) {
-        memset(&result, 0, sizeof(result));
-        result.image_width = fb->width;
-        result.image_height = fb->height;
-        ESP_LOGW(TAG, "Fruit detection failed: 0x%x", det_ret);
-    } else {
+    if (detect_ok) {
         m0_uart_build_payload(&result, &uart_payload);
         esp_err_t uart_ret = m0_uart_send_result(&result);
         if (uart_ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
         }
+    } else {
+        ESP_LOGW(TAG, "No stable detection; skipping M0 output");
     }
 
     esp_err_t res = ESP_OK;
@@ -241,7 +310,7 @@ static esp_err_t index_handler(httpd_req_t *req)
 
     res = send_text_chunk(req, page_start);
     if (res == ESP_OK) {
-        res = send_detection_json(req, &result, &uart_payload, det_ret == ESP_OK, NULL);
+        res = send_detection_json(req, &result, &uart_payload, detect_ok, NULL);
     }
     if (res == ESP_OK) {
         res = send_text_chunk(req, ";let detectOk=!!data.detect_ok;let imageSrc='data:image/jpeg;base64,");
@@ -327,33 +396,23 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 static esp_err_t snapshot_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = camera_capture();
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    if (fb->format != PIXFORMAT_JPEG) {
-        ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
-        camera_return(fb);
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
+    camera_fb_t *fb = NULL;
     fruit_detect_result_t result;
-    esp_err_t det_ret = fruit_detect_process(fb, &result);
+    bool detect_ok = false;
+    if (capture_stable_detection(&fb, &result, &detect_ok) != ESP_OK || !fb) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
     m0_uart_payload_t uart_payload = {0};
-    if (det_ret != ESP_OK) {
-        memset(&result, 0, sizeof(result));
-        result.image_width = fb->width;
-        result.image_height = fb->height;
-        ESP_LOGW(TAG, "Fruit detection failed: 0x%x", det_ret);
-    } else {
+    if (detect_ok) {
         m0_uart_build_payload(&result, &uart_payload);
         esp_err_t uart_ret = m0_uart_send_result(&result);
         if (uart_ret != ESP_OK) {
             ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
         }
+    } else {
+        ESP_LOGW(TAG, "No stable detection; skipping M0 output");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -361,7 +420,7 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    esp_err_t res = send_detection_json(req, &result, &uart_payload, det_ret == ESP_OK, fb);
+    esp_err_t res = send_detection_json(req, &result, &uart_payload, detect_ok, fb);
     camera_return(fb);
     if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, NULL, 0);

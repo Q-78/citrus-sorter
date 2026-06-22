@@ -70,6 +70,7 @@ bool fruit_detect_board_relative_coord(const board_info_t *board,
                                        uint16_t pixel_y,
                                        float *relative_x,
                                        float *relative_y);
+bool fruit_detect_board_geometry_valid(const board_info_t *board);
 const char *fruit_grade_label(fruit_grade_t grade);
 
 #ifdef __cplusplus

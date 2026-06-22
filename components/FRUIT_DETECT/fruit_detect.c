@@ -15,6 +15,8 @@ static const char *TAG = "fruit_detect";
 #define MIN_BLOB_AREA 350
 #define MIN_DIAMETER_PX 35
 #define LARGE_MIN_REFERENCE_RATIO_X1000 440U
+#define BOARD_MIN_CORNER_ANGLE_DEG 65.0f
+#define BOARD_MAX_CORNER_ANGLE_DEG 115.0f
 
 typedef struct {
     uint32_t sum_x;
@@ -370,6 +372,49 @@ static float quad_area2(const board_info_t *board)
     return fabsf(area);
 }
 
+static bool board_corner_angle_valid(float prev_x,
+                                     float prev_y,
+                                     float corner_x,
+                                     float corner_y,
+                                     float next_x,
+                                     float next_y)
+{
+    float ax = prev_x - corner_x;
+    float ay = prev_y - corner_y;
+    float bx = next_x - corner_x;
+    float by = next_y - corner_y;
+    float len_a = sqrtf(ax * ax + ay * ay);
+    float len_b = sqrtf(bx * bx + by * by);
+    if (len_a < 1.0f || len_b < 1.0f) {
+        return false;
+    }
+
+    float cos_angle = (ax * bx + ay * by) / (len_a * len_b);
+    float min_cos = cosf(BOARD_MAX_CORNER_ANGLE_DEG * (float)M_PI / 180.0f);
+    float max_cos = cosf(BOARD_MIN_CORNER_ANGLE_DEG * (float)M_PI / 180.0f);
+    return cos_angle >= min_cos && cos_angle <= max_cos;
+}
+
+bool fruit_detect_board_geometry_valid(const board_info_t *board)
+{
+    if (!board || !board->found) {
+        return false;
+    }
+
+    return board_corner_angle_valid(board->bl_x, board->bl_y,
+                                    board->tl_x, board->tl_y,
+                                    board->tr_x, board->tr_y) &&
+           board_corner_angle_valid(board->tl_x, board->tl_y,
+                                    board->tr_x, board->tr_y,
+                                    board->br_x, board->br_y) &&
+           board_corner_angle_valid(board->tr_x, board->tr_y,
+                                    board->br_x, board->br_y,
+                                    board->bl_x, board->bl_y) &&
+           board_corner_angle_valid(board->br_x, board->br_y,
+                                    board->bl_x, board->bl_y,
+                                    board->tl_x, board->tl_y);
+}
+
 static bool blue_marker_board_geometry_ok(const board_info_t *board,
                                           uint16_t img_w,
                                           uint16_t img_h)
@@ -407,6 +452,10 @@ static bool blue_marker_board_geometry_ok(const board_info_t *board,
     float avg_height = (left_h + right_h) * 0.5f;
     float aspect = avg_width / fmaxf(1.0f, avg_height);
     if (aspect < 1.45f || aspect > 4.2f) {
+        return false;
+    }
+
+    if (!fruit_detect_board_geometry_valid(board)) {
         return false;
     }
 
