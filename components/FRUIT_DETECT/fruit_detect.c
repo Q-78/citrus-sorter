@@ -14,7 +14,7 @@ static const char *TAG = "fruit_detect";
 #define MAX_LABELS 512
 #define MIN_BLOB_AREA 350
 #define MIN_DIAMETER_PX 35
-#define LARGE_MIN_REFERENCE_RATIO_X1000 440U
+#define LARGE_MIN_REFERENCE_RATIO_X1000 407U
 #define BOARD_MIN_CORNER_ANGLE_DEG 65.0f
 #define BOARD_MAX_CORNER_ANGLE_DEG 115.0f
 
@@ -99,22 +99,26 @@ static bool is_citrus_pixel(uint8_t r, uint8_t g, uint8_t b)
     int minc = min3(r, g, b);
     int delta = maxc - minc;
 
-    if (maxc < 70 || delta < 25) {
+    if (maxc < 65 || delta < 28) {
         return false;
     }
 
     int saturation = delta * 255 / maxc;
     int hue = rgb_hue_deg(r, g, b);
 
-    return saturation >= 45 &&
-           hue >= 8 && hue <= 75 &&
-           r >= 80 &&
-           g >= 35 &&
-           r >= b + 22 &&
-           g >= b + 8 &&
-           b * 100 <= maxc * 60 &&
-           g * 100 >= r * 25 &&
-           g * 100 <= r * 120;
+    bool saturated_or_highlight =
+        saturation >= 140 ||
+        (maxc >= 225 && saturation >= 95 && r >= g + 45 && r >= b + 80);
+
+    return saturated_or_highlight &&
+           hue >= 10 && hue <= 82 &&
+           r >= 75 &&
+           g >= 30 &&
+           r >= b + 38 &&
+           g >= b + 4 &&
+           b * 100 <= maxc * 72 &&
+           g * 100 >= r * 22 &&
+           g * 100 <= r * 125;
 }
 
 static bool is_blue_reference_pixel(uint8_t r, uint8_t g, uint8_t b)
@@ -922,8 +926,7 @@ static bool append_fruit_result(fruit_detect_result_t *result,
         return false;
     }
 
-    uint16_t diameter = (area_diameter * 108U) / 100U;
-    diameter = clamp_u16(diameter, MIN_DIAMETER_PX, max_side);
+    uint16_t diameter = clamp_u16(area_diameter, MIN_DIAMETER_PX, max_side);
 
     fruit_info_t *f = &result->fruits[result->count++];
     f->center_x = (uint16_t)(s->sum_x / s->count);

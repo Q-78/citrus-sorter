@@ -1,12 +1,15 @@
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_camera.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 #include "camera.h"
@@ -18,12 +21,139 @@ static const char *TAG = "camera_web";
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 #define DETECTION_MAX_CAPTURE_ATTEMPTS 3
+#define DETECTION_TASK_INTERVAL_MS 3000
+#define DETECTION_TASK_STACK_SIZE 8192
+#define DETECTION_TASK_PRIORITY 5
 
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
 static const char *STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 static const char BASE64_TABLE[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+typedef struct {
+    bool ready;
+    bool detect_ok;
+    fruit_detect_result_t result;
+    m0_uart_payload_t payload;
+    uint8_t *jpeg_data;
+    size_t jpeg_len;
+    uint32_t sequence;
+} detection_cache_t;
+
+typedef struct {
+    bool detect_ok;
+    fruit_detect_result_t result;
+    m0_uart_payload_t payload;
+    uint8_t *jpeg_data;
+    size_t jpeg_len;
+    uint32_t sequence;
+} detection_snapshot_t;
+
+static SemaphoreHandle_t s_detection_cache_lock;
+static TaskHandle_t s_detection_task_handle;
+static detection_cache_t s_detection_cache;
+
+static void *cache_malloc(size_t size)
+{
+    void *ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ptr) {
+        ptr = malloc(size);
+    }
+    return ptr;
+}
+
+static void release_detection_snapshot(detection_snapshot_t *snapshot)
+{
+    if (!snapshot) {
+        return;
+    }
+    free(snapshot->jpeg_data);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static bool copy_latest_detection_snapshot(detection_snapshot_t *snapshot)
+{
+    if (!snapshot || !s_detection_cache_lock) {
+        return false;
+    }
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (xSemaphoreTake(s_detection_cache_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
+
+    if (!s_detection_cache.ready || !s_detection_cache.jpeg_data ||
+        s_detection_cache.jpeg_len == 0) {
+        xSemaphoreGive(s_detection_cache_lock);
+        return false;
+    }
+
+    snapshot->jpeg_data = cache_malloc(s_detection_cache.jpeg_len);
+    if (!snapshot->jpeg_data) {
+        xSemaphoreGive(s_detection_cache_lock);
+        return false;
+    }
+
+    memcpy(snapshot->jpeg_data,
+           s_detection_cache.jpeg_data,
+           s_detection_cache.jpeg_len);
+    snapshot->jpeg_len = s_detection_cache.jpeg_len;
+    snapshot->detect_ok = s_detection_cache.detect_ok;
+    snapshot->result = s_detection_cache.result;
+    snapshot->payload = s_detection_cache.payload;
+    snapshot->sequence = s_detection_cache.sequence;
+    xSemaphoreGive(s_detection_cache_lock);
+    return true;
+}
+
+static bool wait_for_latest_detection_snapshot(detection_snapshot_t *snapshot)
+{
+    for (uint8_t attempt = 0; attempt < 50; attempt++) {
+        if (copy_latest_detection_snapshot(snapshot)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return false;
+}
+
+static bool update_detection_cache(const camera_fb_t *fb,
+                                   const fruit_detect_result_t *result,
+                                   const m0_uart_payload_t *payload,
+                                   bool detect_ok)
+{
+    if (!fb || !result || !payload || !s_detection_cache_lock ||
+        !fb->buf || fb->len == 0) {
+        return false;
+    }
+
+    uint8_t *jpeg_copy = cache_malloc(fb->len);
+    if (!jpeg_copy) {
+        ESP_LOGE(TAG, "No memory for cached JPEG, need %u bytes",
+                 (unsigned int)fb->len);
+        return false;
+    }
+    memcpy(jpeg_copy, fb->buf, fb->len);
+
+    if (xSemaphoreTake(s_detection_cache_lock, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        free(jpeg_copy);
+        return false;
+    }
+
+    uint8_t *old_jpeg = s_detection_cache.jpeg_data;
+    s_detection_cache.jpeg_data = jpeg_copy;
+    s_detection_cache.jpeg_len = fb->len;
+    s_detection_cache.result = *result;
+    s_detection_cache.payload = *payload;
+    s_detection_cache.detect_ok = detect_ok;
+    s_detection_cache.ready = true;
+    s_detection_cache.sequence++;
+    xSemaphoreGive(s_detection_cache_lock);
+
+    free(old_jpeg);
+    return true;
+}
 
 static esp_err_t send_text_chunk(httpd_req_t *req, const char *text)
 {
@@ -84,7 +214,8 @@ static esp_err_t send_detection_json(httpd_req_t *req,
                                      const fruit_detect_result_t *result,
                                      const m0_uart_payload_t *payload,
                                      bool detect_ok,
-                                     const camera_fb_t *image_fb)
+                                     const uint8_t *image_data,
+                                     size_t image_len)
 {
     const char *reference_mode = "none";
     if (result->board.reference_mode == BOARD_REFERENCE_BLUE_DOTS) {
@@ -156,7 +287,7 @@ static esp_err_t send_detection_json(httpd_req_t *req,
         }
     }
 
-    if (!image_fb) {
+    if (!image_data || image_len == 0) {
         return send_text_chunk(req, "]}");
     }
 
@@ -164,7 +295,7 @@ static esp_err_t send_detection_json(httpd_req_t *req,
     if (err != ESP_OK) {
         return err;
     }
-    err = send_base64_data(req, image_fb->buf, image_fb->len);
+    err = send_base64_data(req, image_data, image_len);
     if (err != ESP_OK) {
         return err;
     }
@@ -250,30 +381,81 @@ static esp_err_t capture_stable_detection(camera_fb_t **out_fb,
     return ESP_FAIL;
 }
 
+static void autonomous_detection_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        camera_fb_t *fb = NULL;
+        fruit_detect_result_t result;
+        bool detect_ok = false;
+        esp_err_t ret = capture_stable_detection(&fb, &result, &detect_ok);
+
+        if (ret == ESP_OK && fb) {
+            m0_uart_payload_t payload = {0};
+            if (detect_ok) {
+                m0_uart_build_payload(&result, &payload);
+                esp_err_t uart_ret = m0_uart_send_result(&result);
+                if (uart_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to send autonomous result to M0: 0x%x",
+                             uart_ret);
+                }
+            } else {
+                ESP_LOGW(TAG, "No stable autonomous detection; skipping M0 output");
+            }
+
+            if (!update_detection_cache(fb, &result, &payload, detect_ok)) {
+                ESP_LOGW(TAG, "Failed to update latest detection cache");
+            }
+            camera_return(fb);
+        } else {
+            ESP_LOGW(TAG, "Autonomous capture failed: 0x%x", ret);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(DETECTION_TASK_INTERVAL_MS));
+    }
+}
+
+esp_err_t start_camera_detection_task(void)
+{
+    if (s_detection_task_handle) {
+        return ESP_OK;
+    }
+
+    if (!s_detection_cache_lock) {
+        s_detection_cache_lock = xSemaphoreCreateMutex();
+        if (!s_detection_cache_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    BaseType_t created = xTaskCreate(autonomous_detection_task,
+                                     "camera_detect",
+                                     DETECTION_TASK_STACK_SIZE,
+                                     NULL,
+                                     DETECTION_TASK_PRIORITY,
+                                     &s_detection_task_handle);
+    if (created != pdPASS) {
+        s_detection_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "Autonomous detection task started, interval=%d ms",
+             DETECTION_TASK_INTERVAL_MS);
+    return ESP_OK;
+}
+
 static esp_err_t index_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
 
-    camera_fb_t *fb = NULL;
-    fruit_detect_result_t result;
-    bool detect_ok = false;
-    esp_err_t capture_ret = capture_stable_detection(&fb, &result, &detect_ok);
-    if (capture_ret != ESP_OK || !fb) {
+    detection_snapshot_t snapshot;
+    if (!wait_for_latest_detection_snapshot(&snapshot)) {
         return httpd_resp_send(req,
-                               "<!DOCTYPE html><html><body><h2>Capture failed</h2>"
-                               "<p>Camera did not return a frame.</p></body></html>",
+                               "<!DOCTYPE html><html><body><h2>Detection not ready</h2>"
+                               "<p>The autonomous detector has not produced a frame yet.</p>"
+                               "</body></html>",
                                HTTPD_RESP_USE_STRLEN);
-    }
-
-    m0_uart_payload_t uart_payload = {0};
-    if (detect_ok) {
-        m0_uart_build_payload(&result, &uart_payload);
-        esp_err_t uart_ret = m0_uart_send_result(&result);
-        if (uart_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
-        }
-    } else {
-        ESP_LOGW(TAG, "No stable detection; skipping M0 output");
     }
 
     esp_err_t res = ESP_OK;
@@ -295,7 +477,7 @@ static esp_err_t index_handler(httpd_req_t *req)
         "th,td{padding:8px;border-bottom:1px solid #263645;text-align:left;font-size:13px}th{background:#223042;color:#b9c6d3}.empty{padding:14px;color:#9aa7b5}"
         ".ok{color:#55d68b}.warn{color:#ffbd5a}.small{color:#7bdff2}.large{color:#ff6b6b}"
         "</style></head><body><div class='bar'><h2>Citrus Sorter Debug</h2>"
-        "<div class='actions'><a class='btn' href='/'>Refresh Capture</a>"
+        "<div class='actions'><a class='btn' href='/'>Refresh Latest Result</a>"
         "<a class='btn secondary' href='/?auto=1'>Auto Refresh (3s)</a>"
         "<a class='btn secondary' href='/capture'>Raw JPEG</a>"
         "<a class='btn secondary' href='/stream'>MJPEG Stream</a></div></div>"
@@ -310,13 +492,18 @@ static esp_err_t index_handler(httpd_req_t *req)
 
     res = send_text_chunk(req, page_start);
     if (res == ESP_OK) {
-        res = send_detection_json(req, &result, &uart_payload, detect_ok, NULL);
+        res = send_detection_json(req,
+                                  &snapshot.result,
+                                  &snapshot.payload,
+                                  snapshot.detect_ok,
+                                  NULL,
+                                  0);
     }
     if (res == ESP_OK) {
         res = send_text_chunk(req, ";let detectOk=!!data.detect_ok;let imageSrc='data:image/jpeg;base64,");
     }
     if (res == ESP_OK) {
-        res = send_base64_data(req, fb->buf, fb->len);
+        res = send_base64_data(req, snapshot.jpeg_data, snapshot.jpeg_len);
     }
 
     bool auto_refresh = false;
@@ -349,7 +536,7 @@ static esp_err_t index_handler(httpd_req_t *req)
         "ctx.fillStyle=color;ctx.fillRect(f.bbox_x,y-13,w,16);ctx.fillStyle='#101418';ctx.fillText(label,f.bbox_x+4,y);}}"
         "function fillInfo(){document.getElementById('count').textContent=data.count;"
         "document.getElementById('size').textContent=data.image_width+' x '+data.image_height;"
-        "const s=document.getElementById('status');s.textContent=detectOk?'OK':'Decode Error';s.className='value '+(detectOk?'ok':'warn');"
+        "const s=document.getElementById('status');s.textContent=detectOk?'OK':'No Stable Frame';s.className='value '+(detectOk?'ok':'warn');"
         "const b=data.board;document.getElementById('boardstatus').textContent=b.found?(b.reference_mode+' '+b.bbox_w+' x '+b.bbox_h):'--';"
         "const u=data.uart;document.getElementById('m0frame').textContent=u.header+' '+u.has_fruit+' '+u.grade+' '+u.x.toFixed(2)+' '+u.y.toFixed(2);"
         "document.getElementById('m0coords').innerHTML='has_fruit: '+u.has_fruit+' &nbsp; grade: '+u.grade+'<br>'"
@@ -386,7 +573,7 @@ static esp_err_t index_handler(httpd_req_t *req)
         res = send_text_chunk(req, page_finish);
     }
 
-    camera_return(fb);
+    release_detection_snapshot(&snapshot);
 
     if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, NULL, 0);
@@ -396,23 +583,10 @@ static esp_err_t index_handler(httpd_req_t *req)
 
 static esp_err_t snapshot_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = NULL;
-    fruit_detect_result_t result;
-    bool detect_ok = false;
-    if (capture_stable_detection(&fb, &result, &detect_ok) != ESP_OK || !fb) {
+    detection_snapshot_t snapshot;
+    if (!copy_latest_detection_snapshot(&snapshot)) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
-    }
-
-    m0_uart_payload_t uart_payload = {0};
-    if (detect_ok) {
-        m0_uart_build_payload(&result, &uart_payload);
-        esp_err_t uart_ret = m0_uart_send_result(&result);
-        if (uart_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to send result to M0: 0x%x", uart_ret);
-        }
-    } else {
-        ESP_LOGW(TAG, "No stable detection; skipping M0 output");
     }
 
     httpd_resp_set_type(req, "application/json");
@@ -420,8 +594,13 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Pragma", "no-cache");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    esp_err_t res = send_detection_json(req, &result, &uart_payload, detect_ok, fb);
-    camera_return(fb);
+    esp_err_t res = send_detection_json(req,
+                                         &snapshot.result,
+                                         &snapshot.payload,
+                                         snapshot.detect_ok,
+                                         snapshot.jpeg_data,
+                                         snapshot.jpeg_len);
+    release_detection_snapshot(&snapshot);
     if (res == ESP_OK) {
         res = httpd_resp_send_chunk(req, NULL, 0);
     }
@@ -430,25 +609,21 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
 
 static esp_err_t capture_handler(httpd_req_t *req)
 {
-    camera_fb_t *fb = camera_capture();
-    if (!fb) {
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    if (fb->format != PIXFORMAT_JPEG) {
-        ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
-        camera_return(fb);
+    detection_snapshot_t snapshot;
+    if (!copy_latest_detection_snapshot(&snapshot)) {
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "image/jpeg");
     httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-    esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    camera_return(fb);
+    esp_err_t res = httpd_resp_send(req,
+                                    (const char *)snapshot.jpeg_data,
+                                    snapshot.jpeg_len);
+    release_detection_snapshot(&snapshot);
     return res;
 }
 
@@ -462,39 +637,39 @@ static esp_err_t stream_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
     char part_buf[64];
+    uint32_t last_sequence = 0;
 
     while (true) {
-        camera_fb_t *fb = camera_capture();
-        if (!fb) {
-            res = ESP_FAIL;
-            break;
+        detection_snapshot_t snapshot;
+        if (!copy_latest_detection_snapshot(&snapshot)) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
-
-        if (fb->format != PIXFORMAT_JPEG) {
-            ESP_LOGE(TAG, "Captured frame is not JPEG, format=%d", fb->format);
-            camera_return(fb);
-            res = ESP_FAIL;
-            break;
+        if (snapshot.sequence == last_sequence) {
+            release_detection_snapshot(&snapshot);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
         }
+        last_sequence = snapshot.sequence;
 
-        size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, fb->len);
+        size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, snapshot.jpeg_len);
 
         res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
         if (res == ESP_OK) {
             res = httpd_resp_send_chunk(req, part_buf, hlen);
         }
         if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+            res = httpd_resp_send_chunk(req,
+                                        (const char *)snapshot.jpeg_data,
+                                        snapshot.jpeg_len);
         }
 
-        camera_return(fb);
+        release_detection_snapshot(&snapshot);
 
         if (res != ESP_OK) {
             ESP_LOGI(TAG, "Stream client disconnected");
             break;
         }
-
-        vTaskDelay(pdMS_TO_TICKS(500));
     }
 
     return res;
